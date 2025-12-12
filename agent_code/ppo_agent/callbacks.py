@@ -125,7 +125,7 @@ class _Shared:
             depth = int(os.environ.get("BOMBER_VIT_DEPTH", 2))
             num_heads = int(os.environ.get("BOMBER_VIT_HEADS", 4))
             self.policy = PolicyValueViT(
-                in_channels=9,
+                in_channels=10,
                 num_actions=len(ACTIONS),
                 img_size=(s.COLS, s.ROWS),
                 embed_dim=embed_dim,
@@ -358,16 +358,16 @@ def act(self, game_state: dict) -> str:
 
 def state_to_features(game_state: dict) -> np.ndarray:
     if game_state is None:
-        return np.zeros((9, s.COLS, s.ROWS), dtype=np.float32)
+        return np.zeros((10, s.COLS, s.ROWS), dtype=np.float32)
 
     field = game_state['field']
     coins = game_state['coins']
     bombs = game_state['bombs']
-    explosion_map = game_state.get('explosion_map')
+    explosion_map = game_state.get('explosion_map', np.zeros((s.COLS, s.ROWS)))
     self_info = game_state['self']
     others = game_state['others']
 
-    grid = np.zeros((9, s.COLS, s.ROWS), dtype=np.float32)
+    grid = np.zeros((10, s.COLS, s.ROWS), dtype=np.float32)
 
     grid[0] = (field == -1).astype(np.float32)  # walls
     grid[1] = (field == 1).astype(np.float32)   # crates
@@ -393,6 +393,36 @@ def state_to_features(game_state: dict) -> np.ndarray:
             grid[7, ox, oy] = 1.0
         else:
             grid[8, ox, oy] = 1.0
+
+    danger_map = np.zeros((s.COLS, s.ROWS), dtype=np.float32)
+
+    blast_power = s.BOMB_POWER
+
+    for (bx, by), timer in bombs:
+        if timer > (s.BOMB_TIMER - 1):
+            risk = 0.1
+        else:
+            risk = 1.0 - (timer / float(s.BOMB_TIMER))
+
+        danger_map[bx, by] = max(danger_map[bx, by], risk)
+
+        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            for i in range(1, blast_power + 1):
+                nx, ny = bx + dx * i, by + dy * i
+                
+                if not (0 <= nx < s.COLS and 0 <= ny < s.ROWS):
+                    break
+                
+                if field[nx, ny] == -1:
+                    break
+                
+                danger_map[nx, ny] = max(danger_map[nx, ny], risk)
+
+    if explosion_map is not None:
+        active_explosions = (explosion_map > 0).astype(np.float32)
+        danger_map = np.maximum(danger_map, active_explosions)
+
+    grid[9] = danger_map
 
     return grid.astype(np.float32)
 
