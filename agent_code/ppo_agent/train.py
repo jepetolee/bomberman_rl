@@ -2,9 +2,6 @@ from typing import List
 import os
 import json
 from pathlib import Path
-import numpy as np
-from collections import deque
-import settings as s
 
 import torch
 import torch.nn as nn
@@ -13,53 +10,6 @@ import torch.optim as optim
 import events as e
 from .callbacks import state_to_features, ACTIONS, SHARED
 
-def get_distance_to_nearest_enemy(game_state):
-    if game_state is None:
-        return float('inf')
-
-    field = game_state['field']
-    _, _, _, (sx, sy) = game_state['self']
-    others = game_state['others']
-    bombs = game_state['bombs']
-
-    self_name = game_state['self'][0]
-    self_team = self_name.split('_')[0] if self_name else ""
-    
-    enemy_positions = []
-    for o_n, o_s, o_b, (ox, oy) in others:
-        other_team = o_n.split('_')[0] if o_n else ""
-        if other_team != self_team:
-            enemy_positions.append((ox, oy))
-
-    if not enemy_positions:
-        return float('inf')
-
-    dist_map = np.full((s.COLS, s.ROWS), float('inf'))
-    queue = deque()
-
-    for ex, ey in enemy_positions:
-        dist_map[ex, ey] = 0
-        queue.append((ex, ey, 0))
-
-    bomb_locs = { (bx, by) for (bx, by), t in bombs }
-
-    while queue:
-        x, y, d = queue.popleft()
-
-        if x == sx and y == sy:
-            return d
-
-        next_dist = d + 1
-        
-        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-            nx, ny = x + dx, y + dy
-            
-            if 0 <= nx < s.COLS and 0 <= ny < s.ROWS:
-                if dist_map[nx, ny] == float('inf') and field[nx, ny] == 0 and (nx, ny) not in bomb_locs:
-                    dist_map[nx, ny] = next_dist
-                    queue.append((nx, ny, next_dist))
-    
-    return float('inf')
 
 def setup_training(self):
     # Share hyperparameters and optimizer across agent instances
@@ -134,22 +84,6 @@ def game_events_occurred(self, old_game_state: dict, self_action: str, new_game_
         return
 
     reward = _reward_from_events(self, events)
-
-    if old_game_state is not None and new_game_state is not None:
-        dist_old = get_distance_to_nearest_enemy(old_game_state)
-        dist_new = get_distance_to_nearest_enemy(new_game_state)
-        
-        if dist_old != float('inf') and dist_new != float('inf'):
-            if dist_new < dist_old:
-                shaping_reward = 0.5 # Approaching reward
-                reward += shaping_reward
-                self.logger.debug(f"Approaching enemy: +{shaping_reward} (dist {dist_old} -> {dist_new})")
-            
-            elif dist_new > dist_old:
-                shaping_penalty = -0.2 # Retreating reward
-                reward += shaping_penalty
-                self.logger.debug(f"Retreating: {shaping_penalty} (dist {dist_old} -> {dist_new})")
-
     done = False  # terminal handled in end_of_round
 
     # Store step into shared buffers
@@ -196,12 +130,7 @@ def end_of_round(self, last_game_state: dict, last_action: str, events: List[str
         except Exception:
             pass  # Silently ignore errors in score calculation
     
-    if SHARED.buf_rewards:
-        # Fold terminal bonus/penalty into the final transition instead of creating a duplicate entry
-        SHARED.buf_rewards[-1] += final_reward
-        SHARED.buf_dones[-1] = True
-    elif self._last_state_tensor is not None and self._last_action_idx is not None:
-        # Fallback for edge cases where nothing was buffered (e.g., agent never acted)
+    if self._last_state_tensor is not None and self._last_action_idx is not None:
         SHARED.buf_states.append(self._last_state_tensor.squeeze(0))
         SHARED.buf_actions.append(self._last_action_idx)
         SHARED.buf_logps.append(self._last_log_prob)
@@ -366,4 +295,5 @@ def _ppo_update():
             loss.backward()
             nn.utils.clip_grad_norm_(SHARED.policy.parameters(), SHARED.max_grad_norm)
             SHARED.optimizer.step()
+
 
