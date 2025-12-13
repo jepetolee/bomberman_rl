@@ -3,6 +3,7 @@ import os
 import random
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
+from collections import deque
 
 import numpy as np
 import torch
@@ -138,7 +139,7 @@ class _Shared:
                 patch_stride = int(os.environ.get("BOMBER_TRM_PATCH_STRIDE", str(patch_size)))
                 
                 self.policy = PolicyValueViT_TRM(
-                    in_channels=10,
+                    in_channels=11,
                     num_actions=len(ACTIONS),
                     img_size=(s.COLS, s.ROWS),
                     embed_dim=embed_dim,
@@ -160,7 +161,7 @@ class _Shared:
                 depth = int(os.environ.get("BOMBER_VIT_DEPTH", 2))
                 num_heads = int(os.environ.get("BOMBER_VIT_HEADS", 4))
                 self.policy = PolicyValueViT(
-                    in_channels=10,
+                    in_channels=11,
                     num_actions=len(ACTIONS),
                     img_size=(s.COLS, s.ROWS),
                     embed_dim=embed_dim,
@@ -363,9 +364,64 @@ def act(self, game_state: dict) -> str:
     return ACTIONS[action_idx]
 
 
+def _bfs_distance_map(field: np.ndarray, start: Tuple[int, int], targets: List[Tuple[int, int]]) -> np.ndarray:
+    """
+    BFS를 사용하여 시작점에서 목표까지의 거리 맵 생성
+    
+    Args:
+        field: [H, W] 필드 맵 (-1: 벽, 0: 빈 공간, 1: 크레이트)
+        start: (x, y) 시작 위치
+        targets: [(x, y), ...] 목표 위치 리스트
+    Returns:
+        distance_map: [H, W] 각 위치까지의 최단 거리 (도달 불가능하면 -1, 정규화됨)
+    """
+    from collections import deque
+    
+    H, W = field.shape
+    distance_map = np.full((H, W), -1.0, dtype=np.float32)
+    
+    if len(targets) == 0:
+        return distance_map
+    
+    # BFS
+    queue = deque([start])
+    distance_map[start] = 0.0
+    visited = {start}
+    
+    directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+    
+    while queue:
+        x, y = queue.popleft()
+        current_dist = distance_map[x, y]
+        
+        for dx, dy in directions:
+            nx, ny = x + dx, y + dy
+            
+            if not (0 <= nx < H and 0 <= ny < W):
+                continue
+            
+            if (nx, ny) in visited:
+                continue
+            
+            # 벽이나 크레이트는 통과 불가
+            if field[nx, ny] != 0:  # 0 = free space
+                continue
+            
+            distance_map[nx, ny] = current_dist + 1.0
+            visited.add((nx, ny))
+            queue.append((nx, ny))
+    
+    # 정규화: 최대 거리를 1.0으로 (도달 불가능한 곳은 -1로 유지)
+    max_dist = distance_map[distance_map >= 0].max() if np.any(distance_map >= 0) else 1.0
+    if max_dist > 0:
+        distance_map[distance_map >= 0] = distance_map[distance_map >= 0] / max_dist
+    
+    return distance_map
+
+
 def state_to_features(game_state: dict) -> np.ndarray:
     if game_state is None:
-        return np.zeros((10, s.COLS, s.ROWS), dtype=np.float32)
+        return np.zeros((11, s.COLS, s.ROWS), dtype=np.float32)  # 11 channels (added BFS distance map)
 
     field = game_state['field']
     coins = game_state['coins']
@@ -374,7 +430,7 @@ def state_to_features(game_state: dict) -> np.ndarray:
     self_info = game_state['self']
     others = game_state['others']
 
-    grid = np.zeros((10, s.COLS, s.ROWS), dtype=np.float32)
+    grid = np.zeros((11, s.COLS, s.ROWS), dtype=np.float32)  # 11 channels (added BFS distance map)
 
     grid[0] = (field == -1).astype(np.float32)  # walls
     grid[1] = (field == 1).astype(np.float32)   # crates
@@ -430,6 +486,36 @@ def state_to_features(game_state: dict) -> np.ndarray:
         danger_map = np.maximum(danger_map, active_explosions)
 
     grid[9] = danger_map
+
+    # BFS distance map to enemy coins (grid[10])
+    self_name, _, _, (sx, sy) = self_info
+    self_tag = _team_tag(self_name)
+    
+    # 적 위치 찾기
+    enemy_positions = []
+    for other_name, _, _, (ox, oy) in others:
+        tag = _team_tag(other_name)
+        if tag != self_tag:
+            enemy_positions.append((ox, oy))
+    
+    # 적의 코인 찾기 (적 근처의 코인)
+    enemy_coins = []
+    for cx, cy in coins:
+        if len(enemy_positions) > 0:
+            min_enemy_dist = min([abs(cx - ex) + abs(cy - ey) for ex, ey in enemy_positions])
+            if min_enemy_dist < 5:  # 적으로부터 5칸 이내
+                enemy_coins.append((cx, cy))
+        else:
+            # 적이 없으면 모든 코인을 적의 코인으로 간주
+            enemy_coins.append((cx, cy))
+    
+    # BFS 거리 맵 생성
+    if len(enemy_coins) > 0:
+        bfs_map = _bfs_distance_map(field, (sx, sy), enemy_coins)
+        grid[10] = bfs_map
+    else:
+        # 적의 코인이 없으면 -1로 채움
+        grid[10] = -1.0
 
     return grid.astype(np.float32)
 

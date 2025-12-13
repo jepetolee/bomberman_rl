@@ -17,6 +17,7 @@ eggs/
 lib/
 lib64/
 parts/
+.data/
 sdist/
 var/
 wheels/
@@ -111,3 +112,104 @@ screenshots/*.webm
 
 replays/
 results/
+
+# Model files (large)
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.h5
+*.pb
+*.onnx
+*.tflite
+*.weights
+*.bin
+*.safetensors
+
+# Data files (large)
+data/
+*.csv
+*.json
+!package.json
+!tsconfig.json
+!config/*.json
+!config/*.yaml
+!config/*.yml
+*.parquet
+*.feather
+*.arrow
+*.hdf5
+*.h5
+*.npz
+*.npy
+*.mat
+
+# Training outputs
+checkpoints/
+logs/
+wandb/
+tensorboard/
+mlruns/
+lightning_logs/
+outputs/
+experiments/
+
+# Environment and cache
+.env
+.venv
+venv/
+env/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+
+# Large media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.gif
+*.png
+!assets/*.png
+!*.png  # Keep small PNGs
+*.jpg
+*.jpeg
+!assets/*.jpg
+*.tiff
+*.tif
+*.bmp
+
+# Compressed files
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+*.gz
+*.bz2
+*.xz

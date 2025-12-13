@@ -15,11 +15,11 @@ import torch.nn.functional as F
 from typing import List, Tuple, Optional
 import numpy as np
 
-from .models.vit_trm import PolicyValueViT_TRM
+from .models.vit_trm import PolicyValueViT_TRM, PolicyValueViT_TRM_Hybrid
 
 
 def train_policy_deepsup(
-    model: PolicyValueViT_TRM,
+    model,  # PolicyValueViT_TRM or PolicyValueViT_TRM_Hybrid
     states: torch.Tensor,
     actions: torch.Tensor,
     optimizer: torch.optim.Optimizer,
@@ -53,17 +53,38 @@ def train_policy_deepsup(
     
     model.train()
     
+    # Check if model is hybrid or original TRM
+    model_class_name = model.__class__.__name__
+    is_hybrid = (model_class_name == 'PolicyValueViT_TRM_Hybrid')
+    
     # Enable/disable gradient for value head based on train_value flag
-    for param in model.v_head.parameters():
-        param.requires_grad = train_value and (rewards is not None)
-    
-    # Enable gradient for policy head
-    for param in model.pi_head.parameters():
-        param.requires_grad = True
-    
-    # Enable gradient for TRM network (needed for reasoning)
-    for param in model.trm_net.parameters():
-        param.requires_grad = True
+    if is_hybrid:
+        # Hybrid model: ViT has its own heads
+        for param in model.vit.v_head.parameters():
+            param.requires_grad = train_value and (rewards is not None)
+        for param in model.vit.pi_head.parameters():
+            param.requires_grad = True
+        # TRM is detached during pretraining, so no need to set requires_grad
+    else:
+        # Original TRM model
+        for param in model.v_head.parameters():
+            param.requires_grad = train_value and (rewards is not None)
+        
+        # Enable gradient for all policy-related components
+        if hasattr(model, 'patch_proj'):
+            for param in model.patch_proj.parameters():
+                param.requires_grad = True
+        if hasattr(model, 'pos_embed'):
+            model.pos_embed.requires_grad = True
+        if hasattr(model, 'aggregate_norm'):
+            for param in model.aggregate_norm.parameters():
+                param.requires_grad = True
+        if hasattr(model, 'trm_net'):
+            for param in model.trm_net.parameters():
+                param.requires_grad = True
+        if hasattr(model, 'pi_head'):
+            for param in model.pi_head.parameters():
+                param.requires_grad = True
     
     B = states.shape[0]
     states = states.to(device)
@@ -76,16 +97,55 @@ def train_policy_deepsup(
     else:
         train_value = False
     
+    # Check if model is hybrid or original TRM
+    from .models.vit_trm import PolicyValueViT_TRM_Hybrid
+    is_hybrid = isinstance(model, PolicyValueViT_TRM_Hybrid)
+    
     # Initialize z for each sample (zeros for supervised learning)
-    z = torch.zeros(B, model.z_dim, device=device)
+    if is_hybrid:
+        z = torch.zeros(B, model.embed_dim, device=device)
+    else:
+        z = torch.zeros(B, model.z_dim, device=device)
     
     # Patch embedding (shared across all supervision steps)
-    x_embed = model._patch_embed(states)  # [B, N, D]
-    x_embed = x_embed + model.pos_embed
+    if is_hybrid:
+        # Hybrid model: use ViT forward_features directly, no patch embedding needed here
+        # We'll use model.forward() with use_trm=False for pretraining
+        x_embed = None  # Not used for hybrid model
+    else:
+        x_embed = model._patch_embed(states)  # [B, N, D]
+        x_embed = x_embed + model.pos_embed
 
     policy_losses = []
     value_losses = []
     
+    # Hybrid model: use simple forward passes (ViT only, no TRM recursion)
+    if is_hybrid:
+        # For hybrid model during pretraining: use ViT only (use_trm=False)
+        # Simple supervision: just forward pass multiple times
+        for sup_step in range(n_sup):
+            logits, value, _ = model.forward(states, z_prev=None, use_trm=False, detach_trm=True)
+            policy_loss = F.cross_entropy(logits, actions)
+            policy_losses.append(policy_loss)
+            
+            if train_value and rewards is not None:
+                value_loss = F.mse_loss(value, rewards)
+                value_losses.append(value_loss)
+        
+        # Average losses
+        total_policy_loss = torch.stack(policy_losses).mean()
+        total_value_loss = torch.stack(value_losses).mean() if value_losses else torch.tensor(0.0, device=device)
+        
+        # Backward
+        optimizer.zero_grad()
+        total_loss = total_policy_loss + value_weight * total_value_loss
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        return float(total_policy_loss.item()), float(total_value_loss.item())
+    
+    # Original TRM model: use recursive reasoning
     if strategy == "last":
         # Only compute loss on final supervision step (paper approach)
         # Do T-1 steps without gradient, then 1 with gradient
@@ -111,26 +171,28 @@ def train_policy_deepsup(
         
     elif strategy == "all":
         # Compute loss on all supervision steps and average
+        # 각 스텝별로 그래프를 끊어 BPTT 길이를 제한 (TRM 논문 방식)
         step_policy_losses = []
         step_value_losses = []
         
         for sup_step in range(n_sup):
-            if sup_step == n_sup - 1:
-                # Last step: compute with gradient
-                z = model._latent_recursion(x_embed, z, model.n_latent)
-                logits = model.pi_head(z)
-                policy_loss = F.cross_entropy(logits, actions)
-                step_policy_losses.append(policy_loss)
-                
-                if train_value and rewards is not None:
-                    values = model.v_head(z).squeeze(-1)
-                    value_loss = F.mse_loss(values, rewards)
-                    step_value_losses.append(value_loss)
-            else:
-                # Previous steps: update z (with or without gradient)
-                with torch.no_grad():
-                    z = model._latent_recursion(x_embed, z, model.n_latent)
+            # Update z with gradient (all steps contribute to learning)
+            z = model._latent_recursion(x_embed, z, model.n_latent)
+            
+            # Compute loss at each step
+            logits = model.pi_head(z)
+            policy_loss = F.cross_entropy(logits, actions)
+            step_policy_losses.append(policy_loss)
+            
+            if train_value and rewards is not None:
+                values = model.v_head(z).squeeze(-1)
+                value_loss = F.mse_loss(values, rewards)
+                step_value_losses.append(value_loss)
+            
+            # Detach z to avoid very long BPTT chains (per-step supervision)
+            z = z.detach()
         
+        # Average losses across all supervision steps
         policy_loss = torch.stack(step_policy_losses).mean()
         policy_losses.append(policy_loss)
         
@@ -193,17 +255,26 @@ def train_policy_deepsup(
     
     optimizer.zero_grad()
     total_loss.backward()
+    
+    # Gradient clipping for stability
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    
     optimizer.step()
     
     # Re-enable value head gradients (in case it's used elsewhere)
-    for param in model.v_head.parameters():
-        param.requires_grad = True
+    if is_hybrid:
+        for param in model.vit.v_head.parameters():
+            param.requires_grad = True
+    else:
+        if hasattr(model, 'v_head'):
+            for param in model.v_head.parameters():
+                param.requires_grad = True
     
     return float(total_policy_loss.item()), float(total_value_loss.item())
 
 
 def train_with_simulated_experiences(
-    model: PolicyValueViT_TRM,
+    model,  # PolicyValueViT_TRM or PolicyValueViT_TRM_Hybrid
     real_states: torch.Tensor,
     real_actions: torch.Tensor,
     simulated_states: torch.Tensor,
@@ -274,10 +345,32 @@ def train_with_simulated_experiences(
             sim_policy_loss * sim_weight, sim_value_loss * sim_weight)
 
 
-def create_policy_optimizer(model: PolicyValueViT_TRM, lr: float = 1e-4) -> torch.optim.Optimizer:
+def create_policy_optimizer(model, lr: float = 1e-4) -> torch.optim.Optimizer:
     """
-    Create optimizer for policy network only (excluding value head)
+    Create optimizer for policy network (all trainable parameters except value head)
+    Supports both PolicyValueViT_TRM and PolicyValueViT_TRM_Hybrid
     """
-    policy_params = list(model.pi_head.parameters()) + list(model.trm_net.parameters())
+    # Check model type by class name to avoid circular import issues
+    model_class_name = model.__class__.__name__
+    
+    if model_class_name == 'PolicyValueViT_TRM_Hybrid':
+        # Hybrid model: train ViT backbone only during pretraining
+        # (TRM is detached, so we only optimize ViT)
+        policy_params = list(model.vit.parameters())  # ViT backbone (all params including heads)
+        # Note: TRM params are excluded when detach_trm=True
+    else:
+        # Original TRM model - check if attributes exist
+        policy_params = []
+        if hasattr(model, 'patch_proj'):
+            policy_params.extend(list(model.patch_proj.parameters()))
+        if hasattr(model, 'pos_embed'):
+            policy_params.append(model.pos_embed)
+        if hasattr(model, 'trm_net'):
+            policy_params.extend(list(model.trm_net.parameters()))
+        if hasattr(model, 'aggregate_norm'):
+            policy_params.extend(list(model.aggregate_norm.parameters()))
+        if hasattr(model, 'pi_head'):
+            policy_params.extend(list(model.pi_head.parameters()))
+    
     return torch.optim.AdamW(policy_params, lr=lr, betas=(0.9, 0.95))
 

@@ -8,17 +8,17 @@ model:
   type: "trm"  # "trm" or "vit" (standard)
   
   # Vision Transformer base settings
-  in_channels: 10  # Updated to match state_to_features output
+  in_channels: 11  # Updated to match state_to_features output (added BFS distance map)
   num_actions: 6
   img_size: [17, 17]  # [height, width]
-  embed_dim: 64       # Embedding dimension
+  embed_dim: 256      # Embedding dimension (Very Large model)
   
   # TRM-specific settings
   trm:
     enabled: true
     # z_dim is always equal to embed_dim (not configurable)
-    n_latent: 2            # Number of latent recursion steps
-    n_sup: 8              # Number of supervision steps (DeepSupervision)
+    n_latent: 4            # Number of latent recursion steps
+    n_sup: 8               # Number of supervision steps (DeepSupervision)
     T: 3                   # Deep recursion steps (T-1 no_grad + 1 with grad)
     use_ema: true          # Use Exponential Moving Average
     ema_decay: 0.999       # EMA decay factor
@@ -88,12 +88,12 @@ phase2:
   # DeepSupervision Training
   deepsupervision:
     enabled: true
-    num_epochs: 100
-    batch_size: 128
-    learning_rate: 1e-4
+    num_epochs: 20        # More epochs for large model
+    batch_size: 512        # Increased batch size (RTX 4090 has plenty of VRAM)
+    learning_rate: 5e-4    # Lower LR for very large model (256-dim)
     
     # Strategy: "last" (paper), "all" (average), "weighted" (weighted average)
-    strategy: "last"
+    strategy: "all"
     
     # Value network supervision
     train_value: true              # Train value network with rewards
@@ -179,13 +179,13 @@ env_vars:
   BOMBER_TRM_RECURRENT: "1"
   
   # Model dimensions
-  BOMBER_VIT_DIM: "64"
-  BOMBER_TRM_Z_DIM: "64"
+  BOMBER_VIT_DIM: "256"
+  BOMBER_TRM_Z_DIM: "256"
   
   # TRM hyperparameters
-  BOMBER_TRM_N: "6"
+  BOMBER_TRM_N: "4"
   BOMBER_TRM_T: "3"
-  BOMBER_TRM_N_SUP: "16"
+  BOMBER_TRM_N_SUP: "8"
   BOMBER_TRM_EMA: "0.999"
   
   # Patch settings
@@ -238,7 +238,7 @@ presets:
         n_sup: 24
     phase2:
       deepsupervision:
-        num_epochs: 150
+        num_epochs: 20
         batch_size: 128
   
   # Overlapping patches for more information

@@ -48,15 +48,16 @@ class EnvironmentModel(nn.Module):
         # Combined feature size
         combined_size = encoder_output_size + hidden_dim // 4
         
-        # State transition predictor
+        # State transition predictor (predict state directly)
         self.transition_net = nn.Sequential(
             nn.Linear(combined_size, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, state_size),
+            nn.Sigmoid(),  # Output in [0, 1] range for state prediction
         )
-        
+
         # Reward predictor
         self.reward_net = nn.Sequential(
             nn.Linear(combined_size, hidden_dim),
@@ -64,16 +65,6 @@ class EnvironmentModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
-        )
-        
-        # State decoder (to reconstruct next state)
-        self.state_decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, state_channels, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid(),  # Assume normalized states
         )
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -103,14 +94,9 @@ class EnvironmentModel(nn.Module):
         # Predict reward
         reward_pred = self.reward_net(combined).squeeze(-1)  # [B]
         
-        # Predict next state (in feature space, then decode)
-        next_state_feat_flat = self.transition_net(combined)  # [B, state_size]
-        
-        # Reshape and decode to image space
-        # We'll use a simpler approach: predict difference or use learned features
-        # For simplicity, we can predict state directly or predict residual
-        next_state_feat = next_state_feat_flat.view(B, 256, 4, 4)
-        next_state_pred = self.state_decoder(next_state_feat)  # [B, C, H, W]
+        # Predict next state directly
+        next_state_pred = self.transition_net(combined)  # [B, state_size]
+        next_state_pred = next_state_pred.view(B, self.state_channels, self.state_height, self.state_width)  # Reshape to [B, C, H, W]
         
         # If deterministic, return directly; otherwise add noise
         if not self.use_deterministic and self.training:
@@ -154,11 +140,15 @@ def create_env_model(
         model = model.to(device)
     
     if model_path is not None:
-        try:
-            state_dict = torch.load(model_path, map_location=device)
-            model.load_state_dict(state_dict)
-        except Exception as e:
-            print(f"Warning: Could not load environment model from {model_path}: {e}")
+        import os
+        if os.path.exists(model_path):
+            try:
+                state_dict = torch.load(model_path, map_location=device)
+                model.load_state_dict(state_dict, strict=False)  # Use strict=False to handle architecture changes
+            except Exception as e:
+                # Silently fail if model can't be loaded (e.g., architecture mismatch)
+                # This is expected if planning is not being used
+                pass
     
     return model
 

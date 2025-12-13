@@ -17,8 +17,9 @@ import sys
 import argparse
 import pickle
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import random
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -28,6 +29,7 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import settings as s
+from config.load_config import load_config, get_phase2_config, get_model_config, create_model_from_config, apply_config_to_env
 from agent_code.ppo_agent.models.environment_model import EnvironmentModel, create_env_model
 from agent_code.ppo_agent.models.vit_trm import PolicyValueViT_TRM
 from agent_code.ppo_agent.dyna_planning import DynaPlanner, VisitedStatesBuffer
@@ -189,13 +191,19 @@ def train_env_model(
 
 def train_policy_with_planning(
     data_dir: str,
-    env_model_path: str,
+    env_model_path: Optional[str],
     policy_model_path: str,
     num_epochs: int = 100,
     batch_size: int = 64,
     n_planning_steps: int = 100,
     n_sup: int = 16,
     lr: float = 1e-4,
+    strategy: str = "last",
+    train_value: bool = True,
+    value_weight: float = 0.5,
+    real_weight: float = 1.0,
+    sim_weight: float = 0.5,
+    config_path: str = "config/trm_config.yaml",
     device: torch.device = None,
 ):
     """Train policy with Dyna-Q planning + DeepSupervision"""
@@ -204,110 +212,167 @@ def train_policy_with_planning(
     
     print(f"Training policy with planning on device: {device}")
     
+    # Load config for model creation
+    from config.load_config import load_config as load_config_func, create_model_from_config
+    config = load_config_func(config_path)
+    
     # Load episodes
     episodes = load_all_episodes(data_dir)
     if len(episodes) == 0:
         raise ValueError(f"No episodes found in {data_dir}")
     
-    # Load environment model
-    env_model = create_env_model(
-        state_channels=9,
-        state_height=s.ROWS,
-        state_width=s.COLS,
-        num_actions=len(ACTIONS),
-        model_path=env_model_path,
-        device=device,
-    )
+    # Load environment model (if planning is enabled)
+    env_model = None
+    if env_model_path is not None:
+        env_model = create_env_model(
+            state_channels=10,  # Updated to match state_to_features output
+            state_height=s.ROWS,
+            state_width=s.COLS,
+            num_actions=len(ACTIONS),
+            model_path=env_model_path,
+            device=device,
+        )
     
-    # Create Dyna planner
-    from agent_code.ppo_agent.dyna_planning import DynaPlanner
-    visited_states = VisitedStatesBuffer(max_size=10000)
-    planner = DynaPlanner(env_model, visited_states, device=device)
+    # Create Dyna planner (if planning is enabled)
+    planner = None
+    if env_model is not None:
+        from agent_code.ppo_agent.dyna_planning import DynaPlanner
+        visited_states = VisitedStatesBuffer(max_size=10000)
+        planner = DynaPlanner(env_model, visited_states, device=device)
+        
+        # Populate visited states from real episodes
+        print("Populating visited states buffer...")
+        for episode in episodes:
+            states = episode['states']
+            actions = episode['teacher_actions']
+            for state, action in zip(states, actions):
+                state_tensor = torch.from_numpy(state).float()
+                planner.add_experience(state_tensor, int(action))
+        
+        print(f"Visited states buffer size: {len(visited_states)}")
     
-    # Populate visited states from real episodes
-    print("Populating visited states buffer...")
-    for episode in episodes:
-        states = episode['states']
-        actions = episode['teacher_actions']
-        for state, action in zip(states, actions):
-            state_tensor = torch.from_numpy(state).float()
-            planner.add_experience(state_tensor, int(action))
-    
-    print(f"Visited states buffer size: {len(visited_states)}")
-    
-    # Create policy model
-    embed_dim = int(os.environ.get("BOMBER_VIT_DIM", 64))
-    z_dim = int(os.environ.get("BOMBER_TRM_Z_DIM", str(embed_dim)))
-    n_latent = int(os.environ.get("BOMBER_TRM_N", "6"))
-    T = int(os.environ.get("BOMBER_TRM_T", "3"))
-    
-    model = PolicyValueViT_TRM(
-        in_channels=9,
-        num_actions=len(ACTIONS),
-        img_size=(s.COLS, s.ROWS),
-        embed_dim=embed_dim,
-        z_dim=z_dim,
-        n_latent=n_latent,
-        n_sup=n_sup,
-        T=T,
-    ).to(device)
+    # Create policy model from config
+    model = create_model_from_config(config, device=device)
     
     optimizer = create_policy_optimizer(model, lr=lr)
     
-    # Extract real experiences
-    states, actions, _, _ = extract_transitions(episodes)
-    states = states.to(device)
-    actions = actions.to(device)
+    # Extract real experiences (including rewards)
+    # Limit number of episodes to avoid OOM (sample randomly if too many)
+    max_episodes_for_training = 1000  # Limit to avoid OOM
+    if len(episodes) > max_episodes_for_training:
+        import random
+        episodes = random.sample(episodes, max_episodes_for_training)
+        print(f"Sampled {max_episodes_for_training} episodes from {len(episodes) + max_episodes_for_training} total")
+    
+    states, actions, rewards, _ = extract_transitions(episodes)
+    # Keep on CPU, move to device only during batch processing
+    # states = states.to(device)  # Don't move all at once
+    # actions = actions.to(device)
+    # rewards = rewards.to(device) if train_value else None
     
     # Training loop
     model.train()
+    
+    # Calculate number of batches per epoch
+    num_real_samples = len(states)
+    num_batches_per_epoch = max(1, num_real_samples // batch_size)
+    
+    print(f"Training configuration:")
+    print(f"  - Total real samples: {num_real_samples}")
+    print(f"  - Batch size: {batch_size}")
+    print(f"  - Batches per epoch: {num_batches_per_epoch}")
+    print(f"  - DeepSupervision steps (n_sup): {n_sup}")
+    print(f"  - Strategy: {strategy}")
+    
     for epoch in range(num_epochs):
-        # Generate simulated experiences via planning
-        print(f"Epoch {epoch+1}/{num_epochs}: Generating simulated experiences...")
-        simulated_experiences = planner.plan(n_planning_steps=n_planning_steps)
+        epoch_real_policy_loss = 0.0
+        epoch_real_value_loss = 0.0
+        epoch_sim_policy_loss = 0.0
+        epoch_sim_value_loss = 0.0
+        num_batches_processed = 0
+        
+        # Generate simulated experiences via planning (if enabled)
+        simulated_experiences = []
+        if planner is not None and n_planning_steps > 0:
+            print(f"\nEpoch {epoch+1}/{num_epochs}: Generating {n_planning_steps} simulated experiences...")
+            simulated_experiences = planner.plan(n_planning_steps=n_planning_steps)
+            print(f"  Generated {len(simulated_experiences)} simulated experiences")
         
         if len(simulated_experiences) > 0:
-            sim_states = torch.stack([s for s, _, _, _ in simulated_experiences]).to(device)
-            sim_actions = torch.tensor([a for _, a, _, _ in simulated_experiences], device=device)
+            sim_states_all = torch.stack([s for s, _, _, _ in simulated_experiences])  # Keep on CPU for now
+            sim_actions_all = torch.tensor([a for _, a, _, _ in simulated_experiences])
+            sim_rewards_all = torch.tensor([r for _, _, r, _ in simulated_experiences]) if train_value else None
         else:
-            sim_states = torch.empty(0, 9, s.ROWS, s.COLS).to(device)
-            sim_actions = torch.empty(0, dtype=torch.long).to(device)
+            sim_states_all = torch.empty(0, 10, s.ROWS, s.COLS)
+            sim_actions_all = torch.empty(0, dtype=torch.long)
+            sim_rewards_all = None
         
-        # Sample batches
-        num_real = min(batch_size // 2, len(states))
-        num_sim = batch_size - num_real
+        # Shuffle data for this epoch
+        real_indices = torch.randperm(num_real_samples)
         
-        real_indices = torch.randperm(len(states))[:num_real]
-        real_batch_states = states[real_indices]
-        real_batch_actions = actions[real_indices]
+        # Process batches
+        for batch_idx in range(num_batches_per_epoch):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, num_real_samples)
+            
+            # Get real batch
+            batch_real_indices = real_indices[start_idx:end_idx]
+            real_batch_states = states[batch_real_indices].to(device)
+            real_batch_actions = actions[batch_real_indices].to(device)
+            real_batch_rewards = rewards[batch_real_indices].to(device) if rewards is not None else None
+            
+            # Get simulated batch (if available)
+            if len(sim_states_all) > 0:
+                num_sim_in_batch = min(batch_size - len(batch_real_indices), len(sim_states_all))
+                sim_batch_indices = torch.randperm(len(sim_states_all))[:num_sim_in_batch]
+                sim_batch_states = sim_states_all[sim_batch_indices].to(device)
+                sim_batch_actions = sim_actions_all[sim_batch_indices].to(device)
+                sim_batch_rewards = sim_rewards_all[sim_batch_indices].to(device) if sim_rewards_all is not None else None
+            else:
+                sim_batch_states = torch.empty(0, 10, s.ROWS, s.COLS).to(device)
+                sim_batch_actions = torch.empty(0, dtype=torch.long).to(device)
+                sim_batch_rewards = None
+            
+            # Train with DeepSupervision (this will perform n_sup iterations internally)
+            real_policy_loss, real_value_loss, sim_policy_loss, sim_value_loss = train_with_simulated_experiences(
+                model=model,
+                real_states=real_batch_states,
+                real_actions=real_batch_actions,
+                simulated_states=sim_batch_states,
+                simulated_actions=sim_batch_actions,
+                optimizer=optimizer,
+                real_rewards=real_batch_rewards,
+                sim_rewards=sim_batch_rewards,
+                train_value=train_value,
+                value_weight=value_weight,
+                real_weight=real_weight,
+                sim_weight=sim_weight,
+                n_sup=n_sup,
+                strategy=strategy,
+                device=device,
+            )
+            
+            epoch_real_policy_loss += real_policy_loss
+            epoch_real_value_loss += real_value_loss
+            epoch_sim_policy_loss += sim_policy_loss
+            epoch_sim_value_loss += sim_value_loss
+            num_batches_processed += 1
+            
+            # Print batch progress every 10 batches or at the end
+            if (batch_idx + 1) % max(1, num_batches_per_epoch // 10) == 0 or batch_idx == num_batches_per_epoch - 1:
+                print(f"  Batch {batch_idx+1}/{num_batches_per_epoch} | "
+                      f"Real P: {real_policy_loss:.4f}, Real V: {real_value_loss:.4f} | "
+                      f"Sim P: {sim_policy_loss:.4f}, Sim V: {sim_value_loss:.4f}")
         
-        if len(sim_states) > 0:
-            sim_indices = torch.randperm(len(sim_states))[:num_sim]
-            sim_batch_states = sim_states[sim_indices]
-            sim_batch_actions = sim_actions[sim_indices]
-        else:
-            sim_batch_states = torch.empty(0, 9, s.ROWS, s.COLS).to(device)
-            sim_batch_actions = torch.empty(0, dtype=torch.long).to(device)
+        # Average losses for the epoch
+        epoch_real_policy_loss /= num_batches_processed
+        epoch_real_value_loss /= num_batches_processed
+        epoch_sim_policy_loss /= num_batches_processed
+        epoch_sim_value_loss /= num_batches_processed
         
-        # Train with DeepSupervision
-        real_loss, sim_loss = train_with_simulated_experiences(
-            model=model,
-            real_states=real_batch_states,
-            real_actions=real_batch_actions,
-            simulated_states=sim_batch_states,
-            simulated_actions=sim_batch_actions,
-            optimizer=optimizer,
-            n_sup=n_sup,
-            strategy="last",
-            real_weight=1.0,
-            sim_weight=0.5,
-            device=device,
-        )
-        
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs} | "
-                  f"Real Loss: {real_loss:.4f} | "
-                  f"Sim Loss: {sim_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs} Summary | "
+              f"Avg Real Policy Loss: {epoch_real_policy_loss:.4f}, Avg Real Value Loss: {epoch_real_value_loss:.4f} | "
+              f"Avg Sim Policy Loss: {epoch_sim_policy_loss:.4f}, Avg Sim Value Loss: {epoch_sim_value_loss:.4f}")
     
     # Save model
     os.makedirs(os.path.dirname(policy_model_path), exist_ok=True)
@@ -316,43 +381,83 @@ def train_policy_with_planning(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Phase 2: Dyna-Q + DeepSupervision Training')
+    parser = argparse.ArgumentParser(description='Phase 2: Dyna-Q Planning + DeepSupervision')
+    parser.add_argument('--config', type=str, default='config/trm_config.yaml', help='Path to YAML config file')
     parser.add_argument('--train-env-model', action='store_true', help='Train environment model')
-    parser.add_argument('--train-policy', action='store_true', help='Train policy with planning')
-    parser.add_argument('--data-dir', type=str, default='data/teacher_episodes', help='Teacher data directory')
-    parser.add_argument('--env-model-path', type=str, default='data/env_models/env_model.pt', help='Environment model path')
-    parser.add_argument('--policy-model-path', type=str, default='data/policy_models/policy_phase2.pt', help='Policy model path')
-    parser.add_argument('--num-epochs', type=int, default=100, help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=64, help='Batch size')
-    parser.add_argument('--planning-steps', type=int, default=100, help='Number of planning steps')
-    parser.add_argument('--n-sup', type=int, default=16, help='Number of supervision steps')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--train-policy', action='store_true', help='Train policy with DeepSupervision')
+    parser.add_argument('--use-planning', action='store_true', help='Use Dyna-Q planning (requires trained env model)')
+    parser.add_argument('--data-dir', type=str, default=None, help='Directory with teacher episodes (overrides config)')
+    parser.add_argument('--env-model-path', type=str, default=None, help='Path to environment model (overrides config)')
+    parser.add_argument('--policy-model-path', type=str, default=None, help='Path to save policy model (overrides config)')
+    parser.add_argument('--num-epochs', type=int, default=None, help='Number of training epochs (overrides config)')
+    parser.add_argument('--batch-size', type=int, default=None, help='Batch size (overrides config)')
+    parser.add_argument('--n-sup', type=int, default=None, help='Number of supervision steps (overrides config)')
+    parser.add_argument('--planning-steps', type=int, default=None, help='Number of planning steps per epoch (overrides config)')
+    parser.add_argument('--lr', type=float, default=None, help='Learning rate (overrides config)')
+    parser.add_argument('--train-value', action='store_true', default=None, help='Train value network with rewards (overrides config)')
     
     args = parser.parse_args()
+    
+    # Load YAML configuration
+    config = load_config(args.config)
+    phase2_cfg = get_phase2_config(config)
+    model_cfg = get_model_config(config)
+    
+    # Apply config to environment variables
+    apply_config_to_env(config)
+    
+    # Use command line args if provided, otherwise use config
+    data_dir = args.data_dir or phase2_cfg.get('data_dir', 'data/teacher_episodes')
+    env_model_path = args.env_model_path or phase2_cfg.get('env_model', {}).get('model_path', 'data/env_models/env_model.pt')
+    policy_model_path = args.policy_model_path or phase2_cfg.get('deepsupervision', {}).get('policy_model_path', 'ppo_model.pt')
+    
+    # DeepSupervision config
+    deepsup_cfg = phase2_cfg.get('deepsupervision', {})
+    num_epochs = args.num_epochs or deepsup_cfg.get('num_epochs', 100)
+    batch_size = args.batch_size or deepsup_cfg.get('batch_size', 64)
+    n_sup = args.n_sup or model_cfg.get('trm', {}).get('n_sup', 16)
+    # Ensure lr is a float (YAML might read scientific notation as string)
+    lr = float(args.lr if args.lr is not None else deepsup_cfg.get('learning_rate', 1e-4))
+    strategy = deepsup_cfg.get('strategy', 'last')
+    train_value = args.train_value if args.train_value is not None else deepsup_cfg.get('train_value', True)
+    value_weight = float(deepsup_cfg.get('value_weight', 0.5))
+    real_weight = float(deepsup_cfg.get('real_experience_weight', 1.0))
+    sim_weight = float(deepsup_cfg.get('sim_experience_weight', 0.5))
+    
+    # Planning config
+    planning_cfg = phase2_cfg.get('planning', {})
+    n_planning_steps = args.planning_steps or planning_cfg.get('n_planning_steps', 100)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     if args.train_env_model:
+        env_model_cfg = phase2_cfg.get('env_model', {})
         train_env_model(
-            data_dir=args.data_dir,
-            model_path=args.env_model_path,
-            num_epochs=args.num_epochs,
-            batch_size=args.batch_size,
-            device=device,
+            data_dir=data_dir,
+            model_path=env_model_path,
+            num_epochs=env_model_cfg.get('num_epochs', 50),
+            batch_size=env_model_cfg.get('batch_size', 128),
+            lr=float(env_model_cfg.get('learning_rate', 1e-3)),
         )
     
     if args.train_policy:
+        use_planning = args.use_planning or planning_cfg.get('enabled', False)
         train_policy_with_planning(
-            data_dir=args.data_dir,
-            env_model_path=args.env_model_path,
-            policy_model_path=args.policy_model_path,
-            num_epochs=args.num_epochs,
-            batch_size=args.batch_size,
-            n_planning_steps=args.planning_steps,
-            n_sup=args.n_sup,
-            lr=args.lr,
-            device=device,
+            data_dir=data_dir,
+            env_model_path=env_model_path if use_planning else None,
+            policy_model_path=policy_model_path,
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            n_planning_steps=n_planning_steps if use_planning else 0,
+            n_sup=n_sup,
+            lr=lr,
+            strategy=strategy,
+            train_value=train_value,
+            value_weight=value_weight,
+            real_weight=real_weight,
+            sim_weight=sim_weight,
+            config_path=args.config,  # Pass config path
         )
 
 

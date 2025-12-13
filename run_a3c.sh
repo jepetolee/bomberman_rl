@@ -29,12 +29,9 @@ echo ""
 echo "Starting in 3 seconds... (Ctrl+C to cancel)"
 sleep 3
 
-python3 a3c_train.py \
+python3 a3c_gpu_train.py \
     --num-workers ${WORKERS} \
-    --total-rounds ${ROUNDS} \
-    --opponent aggressive_teacher_agent \
-    --selfplay \
-    --selfplay-ratio 0.2
+    --total-rounds ${ROUNDS}
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"

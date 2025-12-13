@@ -22,7 +22,6 @@ AGENT_API = {
     "train": {
         "setup_training": ["self"],
         "game_events_occurred": ["self", "old_game_state: dict", "self_action: str", "new_game_state: dict", "events: List[str]"],
-        # "enemy_game_events_occurred": ["self", "enemy_name: str", "old_enemy_game_state: dict", "enemy_action: str", "enemy_game_state: dict", "enemy_events: List[str]"],
         "end_of_round": ["self", "last_game_state: dict", "last_action: str", "events: List[str]"]
     }
 }

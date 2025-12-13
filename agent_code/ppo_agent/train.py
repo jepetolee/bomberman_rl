@@ -74,7 +74,16 @@ def setup_training(self):
     SHARED.learning_rate = 5e-4      # Slightly higher learning rate (was 3e-4)
 
     if SHARED.optimizer is None:
-        SHARED.optimizer = optim.Adam(SHARED.policy.parameters(), lr=SHARED.learning_rate)
+        # Check if frozen ViT mode is enabled
+        use_frozen_vit = os.environ.get("BOMBER_FROZEN_VIT", "0") == "1"
+        
+        if use_frozen_vit:
+            # Setup optimizer for frozen ViT (ViT 제외, Value Network와 TRM만)
+            from .train_frozen_vit import setup_frozen_vit_optimizer
+            setup_frozen_vit_optimizer()
+        else:
+            # Original optimizer (all parameters)
+            SHARED.optimizer = optim.Adam(SHARED.policy.parameters(), lr=SHARED.learning_rate)
 
 
 def _reward_from_events(self, events: List[str]) -> float:
@@ -88,7 +97,7 @@ def _reward_from_events(self, events: List[str]) -> float:
         
         # Encourage bomb usage - critical for kills!
         e.BOMB_DROPPED: 5.0,          # Much higher reward for dropping bombs (was 2.0)
-        e.COIN_FOUND: 0.1,
+        e.COIN_FOUND: 0.2,            # 적의 코인 발견 시 더 높은 보상 (was 0.1)
         
         # Penalties
         e.KILLED_TEAMMATE: -10.0,
@@ -128,6 +137,75 @@ def _reward_from_events(self, events: List[str]) -> float:
     return float(reward)
 
 
+def _get_distance_to_enemy_coins(game_state: dict) -> float:
+    """적의 코인까지의 최단 거리 반환 (BFS 기반)"""
+    if game_state is None:
+        return float('inf')
+    
+    field = game_state['field']
+    coins = game_state['coins']
+    self_info = game_state['self']
+    others = game_state['others']
+    
+    self_name, _, _, (sx, sy) = self_info
+    self_tag = self_name.split('_')[0] if self_name else ""
+    
+    # 적 위치 찾기
+    enemy_positions = []
+    for other_name, _, _, (ox, oy) in others:
+        tag = other_name.split('_')[0] if other_name else ""
+        if tag != self_tag:
+            enemy_positions.append((ox, oy))
+    
+    # 적의 코인 찾기
+    enemy_coins = []
+    for cx, cy in coins:
+        if len(enemy_positions) > 0:
+            min_enemy_dist = min([abs(cx - ex) + abs(cy - ey) for ex, ey in enemy_positions])
+            if min_enemy_dist < 5:  # 적으로부터 5칸 이내
+                enemy_coins.append((cx, cy))
+        else:
+            enemy_coins.append((cx, cy))
+    
+    if len(enemy_coins) == 0:
+        return float('inf')
+    
+    # BFS로 최단 거리 계산
+    H, W = field.shape
+    queue = deque([(sx, sy)])
+    visited = {(sx, sy)}
+    dist = {(sx, sy): 0}
+    
+    directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+    
+    while queue:
+        x, y = queue.popleft()
+        current_dist = dist[(x, y)]
+        
+        # 목표 코인에 도달했는지 확인
+        if (x, y) in enemy_coins:
+            return float(current_dist)
+        
+        for dx, dy in directions:
+            nx, ny = x + dx, y + dy
+            
+            if not (0 <= nx < H and 0 <= ny < W):
+                continue
+            
+            if (nx, ny) in visited:
+                continue
+            
+            if field[nx, ny] != 0:  # 벽이나 크레이트
+                continue
+            
+            visited.add((nx, ny))
+            dist[(nx, ny)] = current_dist + 1
+            queue.append((nx, ny))
+    
+    # 도달 불가능
+    return float('inf')
+
+
 def game_events_occurred(self, old_game_state: dict, self_action: str, new_game_state: dict, events: List[str]):
     # We rely on values cached in callbacks.act()
     if self._last_state_tensor is None or self._last_action_idx is None:
@@ -149,6 +227,23 @@ def game_events_occurred(self, old_game_state: dict, self_action: str, new_game_
                 shaping_penalty = -0.2 # Retreating reward
                 reward += shaping_penalty
                 self.logger.debug(f"Retreating: {shaping_penalty} (dist {dist_old} -> {dist_new})")
+        
+        # 적의 코인까지 거리 기반 shaping reward
+        coin_dist_old = _get_distance_to_enemy_coins(old_game_state)
+        coin_dist_new = _get_distance_to_enemy_coins(new_game_state)
+        
+        if coin_dist_old != float('inf') and coin_dist_new != float('inf'):
+            if coin_dist_new < coin_dist_old:
+                # 거리가 가까워질수록 더 높은 보상 (역수 관계)
+                coin_shaping_reward = 0.1 * (1.0 / (coin_dist_new + 1.0))  # 거리 기반 보상
+                reward += coin_shaping_reward
+                self.logger.debug(f"Approaching enemy coin: +{coin_shaping_reward:.3f} (dist {coin_dist_old:.1f} -> {coin_dist_new:.1f})")
+            
+            elif coin_dist_new > coin_dist_old:
+                # 거리가 멀어지면 작은 페널티
+                coin_shaping_penalty = -0.05
+                reward += coin_shaping_penalty
+                self.logger.debug(f"Retreating from enemy coin: {coin_shaping_penalty} (dist {coin_dist_old:.1f} -> {coin_dist_new:.1f})")
 
     done = False  # terminal handled in end_of_round
 
@@ -316,6 +411,16 @@ def _compute_gae(rewards, values, dones, *, gamma: float, gae_lambda: float):
 
 
 def _ppo_update():
+    # Check if frozen ViT mode is enabled
+    use_frozen_vit = os.environ.get("BOMBER_FROZEN_VIT", "0") == "1"
+    
+    if use_frozen_vit:
+        # Use frozen ViT update (ViT 고정, Value Network와 TRM만 학습)
+        from .train_frozen_vit import _ppo_update_frozen_vit
+        _ppo_update_frozen_vit()
+        return
+    
+    # Original PPO update (all parameters trainable)
     SHARED.policy.train()
 
     device = SHARED.device
@@ -336,7 +441,6 @@ def _ppo_update():
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
     T = states.size(0)
-    idxs = torch.arange(T)
     
     # Check if using TRM with recurrent z
     from .models.vit_trm import PolicyValueViT_TRM

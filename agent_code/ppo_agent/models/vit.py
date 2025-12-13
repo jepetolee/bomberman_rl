@@ -73,8 +73,10 @@ class PolicyValueViT(nn.Module):
             nn.Linear(hidden, 1),
         )
 
-    def forward(self, x: torch.Tensor):
-        # x: [B, C, H, W]
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Return the pooled ViT feature before heads.
+        """
         x = self.patch_embed(x)
         B, N, D = x.shape
 
@@ -91,7 +93,11 @@ class PolicyValueViT(nn.Module):
             feat = x[:, 0]
         else:
             feat = x.mean(dim=1)
+        return feat
 
+    def forward(self, x: torch.Tensor):
+        # x: [B, C, H, W]
+        feat = self.forward_features(x)
         logits = self.pi_head(feat)
         value = self.v_head(feat).squeeze(-1)
         return logits, value

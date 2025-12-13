@@ -122,7 +122,7 @@ def create_model_from_config(config: Dict[str, Any], device=None):
         Initialized model
     """
     import torch
-    from agent_code.ppo_agent.models.vit_trm import PolicyValueViT_TRM
+    from agent_code.ppo_agent.models.vit_trm import PolicyValueViT_TRM_Hybrid
     import settings as s
     
     if device is None:
@@ -131,20 +131,27 @@ def create_model_from_config(config: Dict[str, Any], device=None):
     model_cfg = get_model_config(config)
     trm_cfg = model_cfg.get('trm', {})
     patch_cfg = model_cfg.get('patch', {})
+    vit_cfg = model_cfg.get('vit', {})
     
-    model = PolicyValueViT_TRM(
-        in_channels=model_cfg.get('in_channels', 9),
+    # Use hybrid model: ViT backbone + TRM residual
+    # For pretraining: use_trm=False (ViT only)
+    # For RL: use_trm=True (ViT + TRM)
+    model = PolicyValueViT_TRM_Hybrid(
+        in_channels=model_cfg.get('in_channels', 11),
         num_actions=model_cfg.get('num_actions', 6),
         img_size=tuple(model_cfg.get('img_size', [s.ROWS, s.COLS])),
         embed_dim=model_cfg.get('embed_dim', 64),
-        z_dim=trm_cfg.get('z_dim', model_cfg.get('embed_dim', 64)),
-        n_latent=trm_cfg.get('n_latent', 6),
-        n_sup=trm_cfg.get('n_sup', 16),
-        T=trm_cfg.get('T', 3),
-        mlp_ratio=model_cfg.get('mlp_ratio', 4.0),
-        drop=model_cfg.get('dropout', 0.0),
-        patch_size=patch_cfg.get('size', 1),
-        patch_stride=patch_cfg.get('stride', 1),
+        # ViT backbone params
+        vit_depth=vit_cfg.get('depth', 2),
+        vit_heads=vit_cfg.get('num_heads', 4),
+        vit_mlp_ratio=model_cfg.get('mlp_ratio', 4.0),
+        vit_patch_size=patch_cfg.get('size', 1),
+        # TRM settings
+        trm_n_latent=trm_cfg.get('n_latent', 6),
+        trm_mlp_ratio=model_cfg.get('mlp_ratio', 4.0),
+        trm_drop=model_cfg.get('dropout', 0.0),
+        trm_patch_size=patch_cfg.get('size', 2),
+        trm_patch_stride=patch_cfg.get('stride', 1),
         use_ema=trm_cfg.get('use_ema', True),
         ema_decay=trm_cfg.get('ema_decay', 0.999),
     ).to(device)
