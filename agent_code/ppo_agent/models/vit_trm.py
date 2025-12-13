@@ -332,7 +332,7 @@ class PolicyValueViT_TRM_Hybrid(nn.Module):
     """
     def __init__(
         self,
-        in_channels: int = 11,
+        in_channels: int = 10,
         num_actions: int = 6,
         img_size: Tuple[int, int] = (17, 17),
         embed_dim: int = 256,

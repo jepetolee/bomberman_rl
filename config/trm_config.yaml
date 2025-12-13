@@ -8,7 +8,7 @@ model:
   type: "trm"  # "trm" or "vit" (standard)
   
   # Vision Transformer base settings
-  in_channels: 11  # Updated to match state_to_features output (added BFS distance map)
+  in_channels: 10  # Must match state_to_features output
   num_actions: 6
   img_size: [17, 17]  # [height, width]
   embed_dim: 256      # Embedding dimension (Very Large model)

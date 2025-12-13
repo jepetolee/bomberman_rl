@@ -137,7 +137,7 @@ def create_model(model_path: str, device: torch.device) -> nn.Module:
     
     # Create hybrid model
     model = PolicyValueViT_TRM_Hybrid(
-        in_channels=model_config.get('in_channels', 11),
+        in_channels=model_config.get('in_channels', 10),
         num_actions=model_config.get('num_actions', 6),
         img_size=tuple(model_config.get('img_size', [17, 17])),
         embed_dim=model_config.get('embed_dim', 256),
