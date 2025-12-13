@@ -1,222 +1,206 @@
-# Bomberman RL
+## Bomberman RL (TRM + ViT Hybrid)
 
-Setup for a project/competition amongst students to train a winning Reinforcement Learning agent for the classic game Bomberman.
+이 레포는 Bomberman 환경에서 **Vision Transformer(ViT)** 기반 정책에 **TRM(Tiny Recursive Model)** 분기를 결합하고, 다음 파이프라인으로 학습합니다.
 
-## Quick Start
+- **Phase 1**: teacher agent로 episode 데이터 수집 (`data/teacher_episodes/episode_*.pt`)
+- **Phase 2**: teacher 데이터로 (선택)환경모델 + **DeepSupervision 사전학습** (`data/policy_models/policy_phase2.pt`)
+- **Phase 3**: A3C 스타일 커리큘럼 RL (원하면 recurrent TRM latent `z`)
 
-### 1. 교사 모델 테스트 (Aggressive Teacher Agent)
-
-새로 구현된 공격적 교사 모델을 테스트해 보세요:
-
-```bash
-# 교사 모델 vs rule_based (GUI 없이)
-python main.py play --agents aggressive_teacher_agent aggressive_teacher_agent rule_based_agent rule_based_agent --n-rounds 30 --no-gui --save-stats results/teacher_test.json
-
-# 결과 시각화
-python plot_results.py results/teacher_test.json
-```
-
-**교사 모델 특징:**
-- ✅ A* 경로 탐색으로 적극적인 적 추적
-- ✅ 팀 협동 (2개 에이전트가 한 팀)
-- ✅ 전략적 폭탄 배치 (탈출 경로 보장)
-- ✅ 코너 감지 및 적 가두기
-- ✅ 팀원 보호 (아군은 절대 공격하지 않음)
-
-**성능 (50 라운드 기준):**
-- Kills: 23 vs 10 (rule_based 대비 **2.3배**)
-- Suicides: 11 vs 77 (rule_based 대비 **7배 더 안전**)
+중요: **BFS는 “보상 shaping”에만 사용**합니다. 관측(feature/embedding)에는 포함하지 않습니다.
 
 ---
 
-## 2. PPO 에이전트 학습
+## 프로젝트 현재 스펙 (중요)
 
-### 기본 학습 (Rule-based 상대)
+- **관측 채널 수**: `in_channels=10`
+  - `agent_code/ppo_agent/callbacks.py: state_to_features()`가 10채널을 생성합니다.
+- **Reward-only BFS coin shaping**: `agent_code/ppo_agent/train.py`
+  - `_get_distance_to_enemy_coins()`로 계산한 거리 변화에 따라 shaping reward를 부여합니다.
+  - (관측에 BFS 맵을 넣지 않습니다.)
+- **Hybrid 모델**: `agent_code/ppo_agent/models/vit_trm.py: PolicyValueViT_TRM_Hybrid`
+  - ViT backbone + TRM residual을 더해 policy/value head로 전달
+
+---
+
+## 설치
+
+### 필수
 
 ```bash
-# 단일 PPO 에이전트 학습 (GUI 없이, 200 라운드)
-python main.py play --agents ppo_agent rule_based_agent rule_based_agent rule_based_agent --train 1 --no-gui --n-rounds 200 --save-stats results/ppo_basic.json
+pip install -r requirements.txt
 ```
 
-### 교사 모델 기반 학습 (권장)
-
-공격적인 교사 모델을 상대로 학습하면 더 강한 에이전트를 만들 수 있습니다:
+### YAML 설정 사용 시
 
 ```bash
-# PPO 에이전트 vs 교사 모델 (2명)
-python main.py play \
-  --agents ppo_agent ppo_agent aggressive_teacher_agent aggressive_teacher_agent \
-  --train 2 \
-  --no-gui \
-  --n-rounds 500 \
-  --save-stats results/ppo_vs_teacher.json
-```
-
-### 커리큘럼 학습
-
-점진적으로 난이도를 높이는 학습:
-
-```bash
-# Phase 1: random 상대 (200 라운드)
-# Phase 2: rule_based 상대 (300 라운드)
-python main.py play \
-  --agents ppo_agent ppo_agent ppo_agent ppo_agent \
-  --train 4 \
-  --curriculum \
-  --phase1-rounds 200 \
-  --phase2-rounds 300 \
-  --phase1-opponent random_agent \
-  --phase2-opponent aggressive_teacher_agent \
-  --no-gui \
-  --save-stats results/ppo_curriculum.json
-```
-
-### 동적 상대 스케줄링
-
-라운드마다 랜덤하게 상대 선택 (점차 어려워짐):
-
-```bash
-# Progressive 모드: fail -> peaceful -> random -> coin -> rule로 점진적 전환
-python main.py play \
-  --agents ppo_agent ppo_agent \
-  --train 2 \
-  --progressive-opponents \
-  --no-fail \
-  --n-rounds 1000 \
-  --no-gui \
-  --save-stats results/ppo_progressive_all.json
-```
-
-```bash
-# Dynamic 모드: rule_based 확률을 5% -> 60%로 점진적 증가
-python main.py play \
-  --agents ppo_agent ppo_agent \
-  --train 2 \
-  --dynamic-opponents \
-  --opponent-pool random_agent coin_collector_agent peaceful_agent \
-  --rb-agent aggressive_teacher_agent \
-  --rb-prob-start 0.05 \
-  --rb-prob-end 0.60 \
-  --n-rounds 1000 \
-  --no-gui \
-  --save-stats results/ppo_dynamic_all.json
+pip install pyyaml
 ```
 
 ---
 
-## 3. 결과 분석 및 시각화
+## 데이터/모델 경로
 
-### 차트 생성
+- **Teacher episodes**: `data/teacher_episodes/episode_*.pt`
+  - 디렉토리가 매우 클 수 있습니다(수십 GB). `.gitignore`로 커밋에서 제외합니다.
+- **Phase 2 policy 모델**: `data/policy_models/policy_phase2.pt`
 
-```bash
-# 기본 차트 (점수, 통계, 라운드별 진행)
-python plot_results.py results/ppo_vs_teacher.json
+---
 
-# 생성되는 차트:
-# - ppo_vs_teacher_scores.png         : 에이전트별 총 점수
-# - ppo_vs_teacher_agent_stats.png    : 코인/킬/자살 통계
-# - ppo_vs_teacher_round_steps.png    : 라운드당 스텝 수
-# - ppo_vs_teacher_combined_score.png : 라운드별 누적 점수 (PPO만)
-# - ppo_vs_teacher_schedule.png       : 상대 스케줄 (dynamic/progressive 모드)
-```
+## 실행(공식 엔트리포인트)
 
-### 커스텀 시각화
+이 레포에서 “공식”으로 유지하는 `.sh`는 2개만 남깁니다.
 
-```bash
-# PPO 에이전트만 포함, 50 라운드 rolling average
-python plot_results.py results/ppo_progressive_all.json \
-  --include ppo_agent \
-  --rolling 50
-```
+- `run_with_config.sh`: YAML 기반으로 Phase1~3 실행
+- `train_phase3.sh`: Phase3 RL 실행(옵션)
 
-### 대결 분석
+---
+
+## 설정(YAML)
+
+- 설정 파일: `config/trm_config.yaml`
+- 로더/적용: `config/load_config.py`
+
+### 1) 설정을 환경변수로 적용만 하기
 
 ```bash
-# 상대별 승/무/패 통계
-python analyze_matchups.py results/ppo_dynamic_all.json
+python3 config/load_config.py --config config/trm_config.yaml --apply-env
 ```
 
-출력 예시:
-```
-Opponents                                      W      D      L   Win%  Rounds
-random_agent, random_agent                    45      2      3   90.0      50
-coin_collector_agent, peaceful_agent          38      5      7   76.0      50
-aggressive_teacher_agent, rule_based_agent    15     10     25   30.0      50
+### 2) Phase별 실행 (권장)
+
+```bash
+# Phase 1: teacher episode 수집
+bash run_with_config.sh config/trm_config.yaml "" phase1
+
+# Phase 2: DeepSupervision 사전학습 (+ planning 옵션은 config에서)
+bash run_with_config.sh config/trm_config.yaml "" phase2
+
+# Phase 3: RL
+bash run_with_config.sh config/trm_config.yaml "" phase3
 ```
 
 ---
 
-## 4. Self-Play 학습 (A3C + AlphaZero 스타일)
-
-### 개념
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    SELF-PLAY TRAINING SYSTEM                    │
-├─────────────────────────────────────────────────────────────────┤
-│  Phase 1: Teacher Training                                      │
-│  ┌─────────────┐         ┌─────────────────────┐               │
-│  │  PPO Agent  │ ──vs──▶ │ aggressive_teacher  │               │
-│  └─────────────┘         └─────────────────────┘               │
-│       │                                                         │
-│       │ Win rate >= 25%                                         │
-│       ▼                                                         │
-│  Phase 2: Self-Play (AlphaZero Style)                          │
-│  ┌─────────────┐         ┌─────────────────────┐               │
-│  │  PPO Agent  │ ──vs──▶ │ Past PPO Versions   │               │
-│  │  (Current)  │         │ (Checkpoints)       │               │
-│  └─────────────┘         └─────────────────────┘               │
-│       │                                                         │
-│       │ Every 200 rounds                                        │
-│       ▼                                                         │
-│  Save new generation checkpoint                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 빠른 실행
+## Phase 1: Teacher 데이터 수집
 
 ```bash
-# 빠른 테스트 (약 30분)
-./run_selfplay.sh --quick
-
-# 표준 학습 (약 2시간)
-./run_selfplay.sh --standard
-
-# 장기 학습 (약 5시간)
-./run_selfplay.sh --long
+python3 collect_teacher_data.py
 ```
 
-### 커스텀 설정
+출력:
+- `data/teacher_episodes/episode_XXXXXX.pt`
+
+---
+
+## Phase 2: DeepSupervision 사전학습
+
+### Policy만 학습(기본)
 
 ```bash
-python3 self_play_train.py \
-    --teacher-rounds 1000 \
-    --selfplay-rounds 2000 \
-    --win-threshold 0.25
+python3 train_phase2.py --train-policy
 ```
 
-### 주요 옵션
+YAML에서 아래가 사용됩니다:
+- `phase2.data_dir`
+- `phase2.deepsupervision.*`
+- `phase2.deepsupervision.policy_model_path` (기본: `data/policy_models/policy_phase2.pt`)
 
-| 옵션 | 기본값 | 설명 |
-|------|--------|------|
-| `--teacher-rounds` | 1000 | Phase 1 학습 라운드 수 |
-| `--selfplay-rounds` | 2000 | Phase 2 학습 라운드 수 |
-| `--win-threshold` | 0.25 | Phase 2로 넘어가는 승률 기준 |
-| `--skip-teacher` | - | Phase 1 건너뛰기 |
-| `--eval-only` | - | 평가만 실행 |
+### (선택) planning 사용
 
-### 결과 확인
+planning을 쓰려면 환경 모델도 함께 쓰게 됩니다(설정에서 on/off).
 
 ```bash
-# 결과 디렉토리 확인
-ls -la results/self_play_*/
-
-# 차트 확인
-python3 plot_results.py results/self_play_*/all_results.json
-
-# 체크포인트 확인
-ls -la agent_code/ppo_agent/checkpoints/
+python3 train_phase2.py --train-env-model
+python3 train_phase2.py --train-policy --use-planning
 ```
+
+---
+
+## Phase 3: A3C 커리큘럼 RL
+
+### 기본 실행
+
+```bash
+python3 a3c_gpu_train.py --num-workers 4 --total-rounds 50000 --model-path data/policy_models/policy_phase2.pt
+```
+
+### (옵션) recurrent TRM z 모드
+
+`train_phase3.sh`는 TRM recurrent 관련 환경변수 설정 + A3C 실행을 묶어둔 스크립트입니다.
+
+```bash
+bash train_phase3.sh
+```
+
+---
+
+## Frozen ViT 모드 (옵션)
+
+ViT 백본은 고정하고, **TRM + value head(및 필요한 head)**만 RL로 미세조정하고 싶다면:
+
+```bash
+BOMBER_FROZEN_VIT=1 PPO_MODEL_PATH=data/policy_models/policy_phase2.pt \
+python3 a3c_gpu_train.py --num-workers 4 --total-rounds 50000 --model-path data/policy_models/policy_phase2.pt
+```
+
+---
+
+## 평가/분석
+
+### 모델 성능 평가
+
+```bash
+python3 evaluate_model.py --model-path data/policy_models/policy_phase2.pt --rounds 50
+```
+
+### “보상 정책” 성향 체크(행동 분포 등)
+
+```bash
+python3 check_reward_policy.py --model-path data/policy_models/policy_phase2.pt --rounds 100 --samples 1000
+```
+
+### 결과 플롯
+
+```bash
+python3 plot_results.py results/some_stats.json
+```
+
+---
+
+## 보상 정책(핵심)
+
+### COIN_FOUND
+
+`environment.py`에서 크레이트가 터지며 코인이 “드러날 때” 이벤트가 발생합니다.
+
+### Reward-only BFS coin shaping
+
+- **목적**: 적 주변 코인에 더 빨리 접근하도록 shaping
+- **중요**: BFS 거리/맵은 **관측(feature)에 넣지 않고**, `train.py`에서 **보상 계산에만 사용**합니다.
+
+코드: `agent_code/ppo_agent/train.py`
+
+---
+
+## 트러블슈팅
+
+### `ModuleNotFoundError: No module named 'yaml'`
+
+```bash
+pip install pyyaml
+```
+
+### CUDA OOM
+
+- Phase2는 teacher 데이터가 크면 메모리 사용량이 커집니다.
+- `config/trm_config.yaml`의 `phase2.deepsupervision.batch_size`를 줄이거나, `train_phase2.py`에서 학습 에피소드 샘플링을 조정하세요.
+
+---
+
+## Git 커밋 / .gitignore
+
+대용량 산출물(teacher 데이터, 모델 체크포인트, 결과 폴더 등)은 `.gitignore`로 제외되어 있습니다.
+설정 파일(`config/*.yaml`)은 커밋됩니다.
 
 ### 체크포인트 구조
 
