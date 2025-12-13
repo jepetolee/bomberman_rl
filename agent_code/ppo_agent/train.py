@@ -337,6 +337,11 @@ def _ppo_update():
 
     T = states.size(0)
     idxs = torch.arange(T)
+    
+    # Check if using TRM with recurrent z
+    from .models.vit_trm import PolicyValueViT_TRM
+    use_recurrent_trm = isinstance(SHARED.policy, PolicyValueViT_TRM) and \
+                        os.environ.get("BOMBER_TRM_RECURRENT", "0") == "1"
 
     for _ in range(SHARED.update_epochs):
         perm = torch.randperm(T)
@@ -347,8 +352,16 @@ def _ppo_update():
             mb_old_logps = old_logps[mb_idx]
             mb_adv = adv[mb_idx]
             mb_returns = returns[mb_idx]
+            mb_dones = dones[mb_idx]
 
-            logits, values_pred = SHARED.policy(mb_states)
+            if use_recurrent_trm:
+                # For recurrent TRM: process each sample independently with z=0
+                # (Each sample is from a different trajectory/timestep)
+                # Alternatively, we could maintain z across the batch if samples are sequential
+                logits, values_pred = SHARED.policy(mb_states)
+            else:
+                logits, values_pred = SHARED.policy(mb_states)
+            
             dist = torch.distributions.Categorical(logits=logits)
             new_logps = dist.log_prob(mb_actions)
             entropy = dist.entropy().mean()

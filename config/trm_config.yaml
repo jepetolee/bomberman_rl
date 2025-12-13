@@ -1,0 +1,255 @@
+# TRM (Tiny Recursive Model) Configuration
+# ==========================================
+# This configuration file defines all hyperparameters for TRM-based training
+
+# Model Architecture
+# ------------------
+model:
+  type: "trm"  # "trm" or "vit" (standard)
+  
+  # Vision Transformer base settings
+  in_channels: 9
+  num_actions: 6
+  img_size: [17, 17]  # [height, width]
+  embed_dim: 64       # Embedding dimension
+  
+  # TRM-specific settings
+  trm:
+    enabled: true
+    z_dim: 64              # Latent state dimension (default: embed_dim)
+    n_latent: 6            # Number of latent recursion steps
+    n_sup: 16              # Number of supervision steps (DeepSupervision)
+    T: 3                   # Deep recursion steps (T-1 no_grad + 1 with grad)
+    use_ema: true          # Use Exponential Moving Average
+    ema_decay: 0.999       # EMA decay factor
+  
+  # Patch embedding settings
+  patch:
+    size: 1                # Patch size (kernel_size)
+    stride: 1              # Patch stride (stride < size = overlapping patches)
+    # Examples:
+    #   size=1, stride=1: 289 patches (17x17, non-overlapping)
+    #   size=2, stride=1: Overlapping patches (more patches)
+    #   size=2, stride=2: 81 patches (9x9, non-overlapping)
+  
+  # MLP settings
+  mlp_ratio: 4.0           # MLP hidden size = embed_dim * mlp_ratio
+  dropout: 0.0             # Dropout rate
+  
+  # Standard ViT settings (if type="vit")
+  vit:
+    depth: 2               # Number of transformer blocks
+    num_heads: 4           # Number of attention heads
+    mixer: "attn"          # "attn" or "gdn"
+    use_cls_token: false
+
+
+# Phase 1: Teacher Data Collection
+# ---------------------------------
+phase1:
+  episodes: 20000          # Total episodes to collect
+  workers: 4               # Number of parallel workers
+  data_dir: "data/teacher_episodes"
+  min_episode_length: 10   # Minimum steps for valid episode
+  
+  # Opponents for data collection
+  opponents:
+    - "random_agent"
+    - "peaceful_agent"
+    - "coin_collector_agent"
+    - "rule_based_agent"
+    - "team_teacher_agent"
+  
+  teacher_agent: "aggressive_teacher_agent"
+
+
+# Phase 2: Dyna-Q Planning + DeepSupervision
+# -------------------------------------------
+phase2:
+  # Environment Model Training
+  env_model:
+    enabled: true
+    num_epochs: 50
+    batch_size: 128
+    learning_rate: 0.001
+    model_path: "data/env_models/env_model.pt"
+    
+    # Architecture
+    hidden_dim: 256
+    use_deterministic: true  # Deterministic vs stochastic transitions
+  
+  # Dyna-Q Planning
+  planning:
+    enabled: true
+    n_planning_steps: 100    # Number of planning steps per epoch
+    visited_states_buffer_size: 10000  # Max visited states to store
+    batch_size: 32           # Batch size for parallel planning
+  
+  # DeepSupervision Training
+  deepsupervision:
+    enabled: true
+    num_epochs: 100
+    batch_size: 64
+    learning_rate: 0.0001
+    
+    # Strategy: "last" (paper), "all" (average), "weighted" (weighted average)
+    strategy: "last"
+    
+    # Experience weights
+    real_experience_weight: 1.0    # Weight for real experiences
+    sim_experience_weight: 0.5     # Weight for simulated experiences
+    
+    # Policy model path
+    policy_model_path: "data/policy_models/policy_phase2.pt"
+  
+  # Data paths
+  data_dir: "data/teacher_episodes"  # Teacher data directory
+
+
+# Phase 3: Recurrent RL Training
+# -------------------------------
+phase3:
+  enabled: true
+  recurrent: true          # Use recurrent z (previous timestep latent)
+  
+  # Training settings
+  workers: 4               # Number of parallel workers
+  total_rounds: 2000
+  rounds_per_batch: 5      # Rounds per batch before update
+  
+  # Model paths
+  phase2_model_path: "data/policy_models/policy_phase2.pt"  # Load Phase 2 model
+  output_model_path: "agent_code/ppo_agent/ppo_model_phase3.pt"
+  
+  # Opponent settings
+  opponent: "aggressive_teacher_agent"
+  selfplay:
+    enabled: true
+    ratio: 0.2             # Probability of self-play vs opponent
+  
+  # PPO hyperparameters
+  ppo:
+    gamma: 0.99            # Discount factor
+    gae_lambda: 0.95       # GAE lambda
+    clip_range: 0.2        # PPO clip range
+    value_coef: 0.5        # Value loss coefficient
+    entropy_coef: 0.01     # Entropy coefficient
+    max_grad_norm: 0.5     # Gradient clipping
+    update_epochs: 4       # Number of update epochs
+    batch_size: 64         # Batch size for PPO updates
+    learning_rate: 0.0001  # Learning rate
+
+
+# Training Configuration
+# ----------------------
+training:
+  device: "cuda"           # "cuda" or "cpu" (auto-detect if not specified)
+  seed: null               # Random seed (null = random)
+  
+  # Checkpointing
+  save_every: 0            # Save checkpoint every N rounds (0 = only latest)
+  checkpoint_dir: "checkpoints"
+  
+  # Logging
+  log_interval: 10         # Log every N epochs/steps
+  verbose: true
+
+
+# Paths and Directories
+# ---------------------
+paths:
+  data_dir: "data"
+  teacher_episodes: "data/teacher_episodes"
+  env_models: "data/env_models"
+  policy_models: "data/policy_models"
+  results: "results"
+  logs: "logs"
+
+
+# Environment Variables Mapping
+# ------------------------------
+# These settings will be exported as environment variables for scripts
+env_vars:
+  # Model type
+  BOMBER_USE_TRM: "1"
+  BOMBER_TRM_RECURRENT: "1"
+  
+  # Model dimensions
+  BOMBER_VIT_DIM: "64"
+  BOMBER_TRM_Z_DIM: "64"
+  
+  # TRM hyperparameters
+  BOMBER_TRM_N: "6"
+  BOMBER_TRM_T: "3"
+  BOMBER_TRM_N_SUP: "16"
+  BOMBER_TRM_EMA: "0.999"
+  
+  # Patch settings
+  BOMBER_TRM_PATCH_SIZE: "1"
+  BOMBER_TRM_PATCH_STRIDE: "1"
+  
+  # Standard ViT (if not using TRM)
+  BOMBER_VIT_DEPTH: "2"
+  BOMBER_VIT_HEADS: "4"
+  BOMBER_VIT_MIXER: "attn"
+  
+  # Model path
+  PPO_MODEL_PATH: "agent_code/ppo_agent/ppo_model_phase3.pt"
+
+
+# Presets
+# -------
+# Quick configuration presets for different scenarios
+
+presets:
+  # Small model for fast training
+  small:
+    model:
+      embed_dim: 32
+      trm:
+        z_dim: 32
+        n_latent: 3
+        n_sup: 8
+    phase2:
+      deepsupervision:
+        num_epochs: 50
+        batch_size: 32
+  
+  # Medium model (default)
+  medium:
+    model:
+      embed_dim: 64
+      trm:
+        z_dim: 64
+        n_latent: 6
+        n_sup: 16
+  
+  # Large model for better performance
+  large:
+    model:
+      embed_dim: 128
+      trm:
+        z_dim: 128
+        n_latent: 8
+        n_sup: 24
+    phase2:
+      deepsupervision:
+        num_epochs: 150
+        batch_size: 128
+  
+  # Overlapping patches for more information
+  overlapping_patches:
+    model:
+      patch:
+        size: 2
+        stride: 1  # Overlapping patches
+  
+  # More supervision steps
+  high_supervision:
+    model:
+      trm:
+        n_sup: 32
+    phase2:
+      planning:
+        n_planning_steps: 200
+

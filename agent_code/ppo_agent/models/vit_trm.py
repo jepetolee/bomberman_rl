@@ -1,0 +1,275 @@
+import math
+from typing import Tuple, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# PatchEmbed removed - using custom implementation with stride support
+
+
+class SwiGLU(nn.Module):
+    """SwiGLU activation function used in TRM paper"""
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=-1)
+        return F.silu(x1) * x2
+
+
+class TRMRecursiveNet(nn.Module):
+    """Tiny 2-layer network for recursive reasoning"""
+    def __init__(self, embed_dim: int, z_dim: int, mlp_ratio: float = 4.0, drop: float = 0.0):
+        super().__init__()
+        hidden_dim = int(embed_dim * mlp_ratio)
+        
+        # Input: x_embed (patches) and z (latent)
+        # We'll concatenate z with each patch or use it separately
+        self.input_proj = nn.Linear(embed_dim + z_dim, embed_dim)
+        
+        # First layer with SwiGLU
+        self.fc1 = nn.Linear(embed_dim, hidden_dim * 2)
+        self.swiglu = SwiGLU()
+        self.drop1 = nn.Dropout(drop)
+        
+        # Second layer
+        self.fc2 = nn.Linear(hidden_dim, embed_dim)
+        self.drop2 = nn.Dropout(drop)
+        
+        # Layer norm
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        # Output projection for z
+        self.z_proj = nn.Linear(embed_dim, z_dim)
+
+    def forward(self, x_embed: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_embed: [B, N, D] patch embeddings
+            z: [B, z_dim] latent state
+        Returns:
+            z_new: [B, z_dim] updated latent state
+        """
+        B, N, D = x_embed.shape
+        z_dim = z.shape[-1]
+        
+        # Aggregate x_embed (mean pooling or use cls-like approach)
+        x_agg = x_embed.mean(dim=1)  # [B, D]
+        
+        # Concatenate aggregated patches with z
+        xz = torch.cat([x_agg, z], dim=-1)  # [B, D + z_dim]
+        
+        # Project to embed_dim
+        h = self.input_proj(xz)  # [B, D]
+        
+        # Two-layer MLP with SwiGLU
+        h = self.fc1(h)  # [B, hidden_dim * 2]
+        h = self.swiglu(h)  # [B, hidden_dim]
+        h = self.drop1(h)
+        h = self.fc2(h)  # [B, D]
+        h = self.drop2(h)
+        
+        # Residual connection and norm
+        h = self.norm(h)
+        
+        # Project to z dimension
+        z_new = self.z_proj(h)  # [B, z_dim]
+        
+        return z_new
+
+
+class PolicyValueViT_TRM(nn.Module):
+    """Vision Transformer with Tiny Recursive Model structure"""
+    def __init__(
+        self,
+        in_channels: int = 8,
+        num_actions: int = 6,
+        img_size: Tuple[int, int] = (17, 17),
+        embed_dim: int = 128,
+        z_dim: Optional[int] = None,
+        n_latent: int = 6,  # Number of latent recursion steps
+        n_sup: int = 16,    # Number of supervision steps
+        T: int = 3,         # Deep recursion steps (T-1 no_grad + 1 with grad)
+        mlp_ratio: float = 4.0,
+        drop: float = 0.0,
+        patch_size: int = 1,
+        patch_stride: int = None,  # If None, uses patch_size (non-overlapping)
+        use_ema: bool = True,
+        ema_decay: float = 0.999,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.z_dim = z_dim if z_dim is not None else embed_dim
+        self.n_latent = n_latent
+        self.n_sup = n_sup
+        self.T = T
+        self.use_ema = use_ema
+        
+        # Patch embedding with smaller patches or overlapping patches
+        # If patch_stride < patch_size, creates overlapping patches for more information
+        if patch_stride is None:
+            patch_stride = patch_size
+        
+        # Create custom patch embedding that supports stride
+        self.patch_size = patch_size
+        self.patch_stride = patch_stride
+        self.img_size = img_size
+        
+        # Calculate number of patches with stride
+        h, w = img_size
+        self.grid_size = (
+            (h - patch_size) // patch_stride + 1,
+            (w - patch_size) // patch_stride + 1
+        )
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+        
+        # Convolution for patch extraction (stride allows overlapping)
+        self.patch_proj = nn.Conv2d(
+            in_channels, embed_dim, 
+            kernel_size=patch_size, 
+            stride=patch_stride,
+            padding=0
+        )
+        
+        # Positional embedding for patches
+        num_tokens = self.num_patches
+        
+        # Positional embedding
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
+        # TRM Recursive Network
+        self.trm_net = TRMRecursiveNet(embed_dim, self.z_dim, mlp_ratio=mlp_ratio, drop=drop)
+        
+        # EMA for stable training (if needed)
+        if use_ema:
+            self.trm_net_ema = TRMRecursiveNet(embed_dim, self.z_dim, mlp_ratio=mlp_ratio, drop=drop)
+            for param in self.trm_net_ema.parameters():
+                param.requires_grad = False
+            self.ema_decay = ema_decay
+            self._update_ema()
+        
+        # Feature aggregation: combine patches and z
+        self.aggregate_norm = nn.LayerNorm(embed_dim)
+        
+        # Policy and Value heads
+        hidden = 256
+        self.pi_head = nn.Sequential(
+            nn.Linear(self.z_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, num_actions),
+        )
+        self.v_head = nn.Sequential(
+            nn.Linear(self.z_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def _update_ema(self):
+        """Update EMA model parameters"""
+        if not self.use_ema:
+            return
+        with torch.no_grad():
+            for ema_param, param in zip(self.trm_net_ema.parameters(), self.trm_net.parameters()):
+                ema_param.data.mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
+
+    def _latent_recursion(self, x_embed: torch.Tensor, z: torch.Tensor, n: int) -> torch.Tensor:
+        """Perform n steps of latent recursion"""
+        for _ in range(n):
+            z = self.trm_net(x_embed, z)
+        return z
+
+    def _deep_recursion(self, x_embed: torch.Tensor, z: torch.Tensor, n: int, T: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Deep recursion: T-1 no_grad steps, then 1 with grad
+        Returns: (z_final, logits_intermediate)
+        """
+        # T-1 no gradient steps to improve z
+        with torch.no_grad():
+            for _ in range(T - 1):
+                z = self._latent_recursion(x_embed, z, n)
+        
+        # Final step with gradients (if training)
+        if self.training:
+            z = self._latent_recursion(x_embed, z, n)
+        else:
+            # Inference: use EMA model if available
+            if self.use_ema:
+                for _ in range(n):
+                    z = self.trm_net_ema(x_embed, z)
+            else:
+                z = self._latent_recursion(x_embed, z, n)
+        
+        return z
+
+    def _patch_embed(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract patches with stride (can be overlapping)
+        
+        Args:
+            x: [B, C, H, W] input image
+        Returns:
+            x_embed: [B, N, D] patch embeddings where N = num_patches
+        """
+        # Extract patches using convolution with stride
+        x_patches = self.patch_proj(x)  # [B, D, H_patches, W_patches]
+        B, D, H_p, W_p = x_patches.shape
+        
+        # Flatten spatial dimensions
+        x_embed = x_patches.flatten(2).transpose(1, 2)  # [B, N, D]
+        return x_embed
+
+    def forward_with_z(self, x: torch.Tensor, z_prev: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with recurrent latent state
+        
+        Args:
+            x: [B, C, H, W] input image
+            z_prev: [B, z_dim] previous timestep latent (None means zeros)
+        Returns:
+            logits: [B, num_actions]
+            value: [B]
+            z_new: [B, z_dim] updated latent for next timestep
+        """
+        B = x.shape[0]
+        device = x.device
+        
+        # Initialize z if not provided
+        if z_prev is None:
+            z = torch.zeros(B, self.z_dim, device=device)
+        else:
+            z = z_prev
+        
+        # Patch embedding with smaller/overlapping patches
+        x_embed = self._patch_embed(x)  # [B, N, D]
+        x_embed = x_embed + self.pos_embed
+        
+        # Initial latent recursion (from previous z)
+        z = self._latent_recursion(x_embed, z, self.n_latent)
+        
+        # Deep supervision: N_sup steps of improvement
+        if self.n_sup > 0:
+            if self.training:
+                # Training: deep supervision with T-step recursion
+                for sup_step in range(self.n_sup):
+                    z = self._deep_recursion(x_embed, z, self.n_latent, self.T)[0]
+            else:
+                # Inference: simple recursion
+                z = self._latent_recursion(x_embed, z, self.n_sup)
+        
+        # Update EMA if training
+        if self.training and self.use_ema:
+            self._update_ema()
+        
+        # Get final feature from z
+        # z is already in the right dimension for heads
+        logits = self.pi_head(z)
+        value = self.v_head(z).squeeze(-1)
+        
+        return logits, value, z
+
+    def forward(self, x: torch.Tensor):
+        """
+        Standard forward (for compatibility, uses z=None)
+        """
+        logits, value, _ = self.forward_with_z(x, z_prev=None)
+        return logits, value
+

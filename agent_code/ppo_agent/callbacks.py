@@ -27,6 +27,7 @@ def _to_device() -> torch.device:
 
 
 from .models.vit import PolicyValueViT
+from .models.vit_trm import PolicyValueViT_TRM
 
 
 class _Shared:
@@ -120,24 +121,58 @@ class _Shared:
             self._stats_file = os.path.join(model_dir, 'teacher_stats.json')
         
         if self.policy is None:
-            mixer = os.environ.get("BOMBER_VIT_MIXER", "attn")
-            embed_dim = int(os.environ.get("BOMBER_VIT_DIM", 64))
-            depth = int(os.environ.get("BOMBER_VIT_DEPTH", 2))
-            num_heads = int(os.environ.get("BOMBER_VIT_HEADS", 4))
-            self.policy = PolicyValueViT(
-                in_channels=10,
-                num_actions=len(ACTIONS),
-                img_size=(s.COLS, s.ROWS),
-                embed_dim=embed_dim,
-                depth=depth,
-                num_heads=num_heads,
-                mlp_ratio=4.0,
-                drop=0.0,
-                attn_drop=0.0,
-                patch_size=1,
-                use_cls_token=False,
-                mixer=mixer,
-            ).to(self.device)
+            use_trm = os.environ.get("BOMBER_USE_TRM", "0") == "1"
+            
+            if use_trm:
+                # TRM model
+                embed_dim = int(os.environ.get("BOMBER_VIT_DIM", 64))
+                z_dim = int(os.environ.get("BOMBER_TRM_Z_DIM", str(embed_dim)))
+                n_latent = int(os.environ.get("BOMBER_TRM_N", "6"))
+                n_sup = int(os.environ.get("BOMBER_TRM_N_SUP", "16"))
+                T = int(os.environ.get("BOMBER_TRM_T", "3"))
+                use_ema = os.environ.get("BOMBER_TRM_EMA", "0.999") != "0"
+                ema_decay = float(os.environ.get("BOMBER_TRM_EMA", "0.999"))
+                
+                # Patch configuration: smaller patch_size and/or overlapping patches
+                patch_size = int(os.environ.get("BOMBER_TRM_PATCH_SIZE", "1"))
+                patch_stride = int(os.environ.get("BOMBER_TRM_PATCH_STRIDE", str(patch_size)))
+                
+                self.policy = PolicyValueViT_TRM(
+                    in_channels=10,
+                    num_actions=len(ACTIONS),
+                    img_size=(s.COLS, s.ROWS),
+                    embed_dim=embed_dim,
+                    z_dim=z_dim,
+                    n_latent=n_latent,
+                    n_sup=n_sup,
+                    T=T,
+                    mlp_ratio=4.0,
+                    drop=0.0,
+                    patch_size=patch_size,
+                    patch_stride=patch_stride,
+                    use_ema=use_ema,
+                    ema_decay=ema_decay,
+                ).to(self.device)
+            else:
+                # Standard ViT model
+                mixer = os.environ.get("BOMBER_VIT_MIXER", "attn")
+                embed_dim = int(os.environ.get("BOMBER_VIT_DIM", 64))
+                depth = int(os.environ.get("BOMBER_VIT_DEPTH", 2))
+                num_heads = int(os.environ.get("BOMBER_VIT_HEADS", 4))
+                self.policy = PolicyValueViT(
+                    in_channels=10,
+                    num_actions=len(ACTIONS),
+                    img_size=(s.COLS, s.ROWS),
+                    embed_dim=embed_dim,
+                    depth=depth,
+                    num_heads=num_heads,
+                    mlp_ratio=4.0,
+                    drop=0.0,
+                    attn_drop=0.0,
+                    patch_size=1,
+                    use_cls_token=False,
+                    mixer=mixer,
+                ).to(self.device)
             # Load checkpoint for both train/eval if available, unless explicitly reset
             reset_requested = os.environ.get("PPO_RESET", "0") == "1"
             if (not reset_requested) and os.path.isfile(self.model_path):
@@ -264,21 +299,9 @@ def setup(self):
     # Assign a stable instance id for multi-agent coordination
     self.instance_id = SHARED.register_instance(self)
 
-    # Optional rule-based guidance for epsilon-greedy exploration
-    self._explore_module = None
-    self._explore_agent = None
-    self._last_epsilon = 0.0
-    if self.train:
-        try:
-            self._explore_module = SHARED.ensure_rule_module()
-            self._explore_agent = SHARED.build_rule_helper(self.logger)
-        except Exception as ex:
-            self._explore_module = None
-            self._explore_agent = None
-            try:
-                self.logger.warning(f"Failed to initialize rule-based explorer: {ex}")
-            except Exception:
-                pass
+    # Recurrent TRM latent state management
+    self._current_z: Optional[torch.Tensor] = None
+    self._last_round = -1
 
     # Runtime scratch vars used between act() and game_events_occurred()
     self._last_state_tensor: Optional[torch.Tensor] = None
@@ -289,48 +312,33 @@ def setup(self):
 
 def act(self, game_state: dict) -> str:
     self.policy.eval()
+    
+    # Check if new round started (reset z)
+    current_round = game_state.get('round', -1)
+    if current_round != self._last_round:
+        self._current_z = None
+        self._last_round = current_round
+    
     obs = state_to_features(game_state)
     x = torch.from_numpy(obs).unsqueeze(0).to(self.device)  # [1, C, H, W]
+    
     with torch.no_grad():
-        logits, value = self.policy(x)
-        # No action masking - let teacher model and PPO decide freely
+        # Check if policy supports recurrent z (TRM model)
+        if hasattr(self.policy, 'forward_with_z'):
+            z_prev = self._current_z
+            logits, value, z_new = self.policy.forward_with_z(x, z_prev=z_prev)
+            self._current_z = z_new  # Store for next timestep
+        else:
+            logits, value = self.policy(x)
+        
+        # No action masking - let PPO decide freely
         # Invalid actions will be handled by the game engine (INVALID_ACTION event)
         cat = torch.distributions.Categorical(logits=logits)
 
-        action_idx: Optional[int] = None
-        used_rule = False
-        epsilon = 0.0
-        if self.train and self._explore_agent is not None and self._explore_module is not None:
-            epsilon = SHARED.current_epsilon()
-            self._last_epsilon = epsilon
-            SHARED.total_action_count += 1
-            if epsilon > 0.0 and random.random() < epsilon:
-                try:
-                    rb_action = self._explore_module.act(self._explore_agent, game_state)
-                    if rb_action in ACTIONS:
-                        candidate_idx = ACTIONS.index(rb_action)
-                        # Use teacher action directly without any validity check
-                        # Game engine will handle invalid actions
-                        action_idx = candidate_idx
-                        used_rule = True
-                        SHARED.teacher_action_count += 1
-                    else:
-                        # Teacher returned invalid action name
-                        SHARED.teacher_invalid_count += 1
-                except Exception as ex:
-                    SHARED.teacher_invalid_count += 1
-                    try:
-                        self.logger.debug(f"Rule-based exploration fallback failed: {ex}")
-                    except Exception:
-                        pass
+        if self.train:
+            action_idx = int(cat.sample().item())
         else:
-            self._last_epsilon = 0.0
-
-        if action_idx is None:
-            if self.train:
-                action_idx = int(cat.sample().item())
-            else:
-                action_idx = int(torch.argmax(logits, dim=-1).item())
+            action_idx = int(torch.argmax(logits, dim=-1).item())
 
         action_tensor = torch.tensor(action_idx, device=self.device)
         log_prob = float(cat.log_prob(action_tensor).item())
@@ -342,8 +350,7 @@ def act(self, game_state: dict) -> str:
             probs_soft = torch.softmax(logits, dim=-1).squeeze(0)
             top_probs, top_inds = torch.topk(probs_soft, k=min(2, probs_soft.numel()))
             top_info = ", ".join([f"{ACTIONS[int(i)]}:{float(p):.2f}" for p, i in zip(top_probs.tolist(), top_inds.tolist())])
-            extra = f" eps={epsilon:.2f} rule={int(used_rule)}"
-            self.logger.debug(f"[step {step}] pos={pos} action={ACTIONS[action_idx]} val={float(value.squeeze(0)):.2f}{extra} top=[{top_info}]")
+            self.logger.debug(f"[step {step}] pos={pos} action={ACTIONS[action_idx]} val={float(value.squeeze(0)):.2f} top=[{top_info}]")
         except Exception:
             pass
 
