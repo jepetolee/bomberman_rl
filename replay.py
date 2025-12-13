@@ -60,10 +60,38 @@ class ReplayWorld(GenericWorld):
         # Perform recorded agent actions
         perm = self.loaded_replay['permutations'][self.step - 1]
         self.replay['permutations'].append(perm)
+        
+        # Build a name-to-agent mapping for safer access
+        # (in case agents died and active_agents length changed)
+        active_agent_names = {a.name: a for a in self.active_agents}
+        
         for i in perm:
+            # Check if index is valid (agents may have died)
+            if i >= len(self.active_agents):
+                # Index out of range - try to find agent by name from original replay
+                # Find agent name from original step's actions
+                step_actions = {}
+                for agent_name in self.loaded_replay['actions'].keys():
+                    if self.step - 1 < len(self.loaded_replay['actions'][agent_name]):
+                        step_actions[agent_name] = self.loaded_replay['actions'][agent_name][self.step - 1]
+                
+                # Skip this iteration - agent probably died before this step
+                continue
+            
             a = self.active_agents[i]
+
+            # Double-check agent is still alive and in active_agent_names
+            if a.name not in active_agent_names or a.dead:
+                continue
+
+            # Check if action exists for this step
+            agent_actions = self.loaded_replay['actions'].get(a.name, [])
+            if self.step - 1 >= len(agent_actions):
+                # No more actions for this agent (probably died earlier)
+                continue
+
             self.logger.debug(f'Repeating action from agent <{a.name}>')
-            action = self.loaded_replay['actions'][a.name][self.step - 1]
+            action = agent_actions[self.step - 1]
             self.logger.info(f'Agent <{a.name}> chose action {action}.')
             self.replay['actions'][a.name].append(action)
             self.perform_agent_action(a, action)
@@ -74,6 +102,31 @@ class ReplayWorld(GenericWorld):
             self.logger.info('Replay ends here, wrap up round')
             time_to_stop = True
         return time_to_stop
+    
+    def get_state_for_agent(self, agent: Agent):
+        """Get game state for an agent (copied from BombeRLeWorld)"""
+        if agent.dead:
+            return None
+
+        state = {
+            'round': self.round,
+            'step': self.step,
+            'field': np.array(self.arena),
+            'self': agent.get_state(),
+            'others': [other.get_state() for other in self.active_agents if other is not agent],
+            'bombs': [bomb.get_state() for bomb in self.bombs],
+            'coins': [coin.get_state() for coin in self.coins if coin.collectable],
+            'user_input': getattr(self, 'user_input', None),
+        }
+
+        explosion_map = np.zeros(self.arena.shape)
+        for exp in self.explosions:
+            if exp.is_dangerous():
+                for (x, y) in exp.blast_coords:
+                    explosion_map[x, y] = max(explosion_map[x, y], exp.timer - 1)
+        state['explosion_map'] = explosion_map
+
+        return state
 
 
 class ReplayAgent(Agent):

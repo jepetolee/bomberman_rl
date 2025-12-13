@@ -129,12 +129,18 @@ def worker_collect_data(
         # Run a single episode
         output_file = os.path.join(data_dir, f'temp_worker_{worker_id}_{episode_id}.json')
         
+        # Save replay file instead of JSON stats
+        replay_dir = os.path.join(data_dir, 'replays')
+        os.makedirs(replay_dir, exist_ok=True)
+        replay_file = os.path.join(replay_dir, f'replay_{worker_id}_{episode_id}.pt')
+        
         cmd = [
             sys.executable, "main.py", "play",
             "--agents"] + agents + [
             "--train", "0",  # No training, just collect data
             "--no-gui",
             "--n-rounds", "1",
+            "--save-replay", replay_file,
             "--save-stats", output_file,
             "--silence-errors",
         ]
@@ -149,48 +155,47 @@ def worker_collect_data(
                 cwd=os.getcwd(),
             )
             
-            if result.returncode == 0:
-                # Load replay if available
-                episode = EpisodeData()
-                
-                # Try to load from replay or stats
+            if result.returncode == 0 and os.path.exists(replay_file):
+                # Extract episode from replay file
                 try:
-                    with open(output_file, 'r') as f:
-                        stats = json.load(f)
+                    from extract_episodes_from_replays import extract_from_replay_world
+                    episode_data = extract_from_replay_world(replay_file, TEACHER_AGENT)
                     
-                    # Extract episode data from stats
-                    # Note: This requires parsing the game replay or stats
-                    # For now, we'll collect via a custom data collection method
-                    
+                    if episode_data is not None and len(episode_data['states']) >= MIN_EPISODE_LENGTH:
+                        # Save episode
+                        episode_file = os.path.join(data_dir, f'episode_{episode_id:06d}.pt')
+                        with open(episode_file, 'wb') as f:
+                            pickle.dump(episode_data, f)
+                        
+                        episodes_queue.put(episode_id)
+                        episodes_collected += 1
+                        
+                        if episodes_collected % 10 == 0:
+                            print(f"[Worker {worker_id}] Collected {episodes_collected} episodes (total: {global_counter.value}/{total_episodes})")
                 except Exception as e:
-                    print(f"[Worker {worker_id}] Failed to parse output: {e}")
-                    continue
-                
-                # Save episode if valid
-                if episode.is_valid():
-                    episode_file = os.path.join(data_dir, f'episode_{episode_id:06d}.pt')
-                    episode_dict = episode.to_dict()
-                    
-                    with open(episode_file, 'wb') as f:
-                        pickle.dump(episode_dict, f)
-                    
-                    episodes_queue.put(episode_id)
-                    episodes_collected += 1
-                    
-                    if episodes_collected % 10 == 0:
-                        print(f"[Worker {worker_id}] Collected {episodes_collected} episodes (total: {global_counter.value}/{total_episodes})")
+                    print(f"[Worker {worker_id}] Failed to extract episode from replay: {e}")
+                    import traceback
+                    traceback.print_exc()
             else:
-                print(f"[Worker {worker_id}] Game failed: {result.stderr[:200]}")
+                if result.returncode != 0:
+                    print(f"[Worker {worker_id}] Game failed: {result.stderr[:200] if result.stderr else 'Unknown error'}")
+                elif not os.path.exists(replay_file):
+                    print(f"[Worker {worker_id}] Replay file not created: {replay_file}")
         
         except subprocess.TimeoutExpired:
             print(f"[Worker {worker_id}] Episode {episode_id} timed out")
         except Exception as e:
             print(f"[Worker {worker_id}] Error in episode {episode_id}: {e}")
+            import traceback
+            traceback.print_exc()
         
-        # Cleanup temp file
+        # Cleanup temp files
         try:
             if os.path.exists(output_file):
                 os.remove(output_file)
+            # Keep replay files for now, can cleanup later if needed
+            # if os.path.exists(replay_file):
+            #     os.remove(replay_file)
         except:
             pass
     

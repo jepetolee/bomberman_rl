@@ -8,7 +8,7 @@ model:
   type: "trm"  # "trm" or "vit" (standard)
   
   # Vision Transformer base settings
-  in_channels: 9
+  in_channels: 10  # Updated to match state_to_features output
   num_actions: 6
   img_size: [17, 17]  # [height, width]
   embed_dim: 64       # Embedding dimension
@@ -16,16 +16,16 @@ model:
   # TRM-specific settings
   trm:
     enabled: true
-    z_dim: 64              # Latent state dimension (default: embed_dim)
-    n_latent: 6            # Number of latent recursion steps
-    n_sup: 16              # Number of supervision steps (DeepSupervision)
+    # z_dim is always equal to embed_dim (not configurable)
+    n_latent: 2            # Number of latent recursion steps
+    n_sup: 8              # Number of supervision steps (DeepSupervision)
     T: 3                   # Deep recursion steps (T-1 no_grad + 1 with grad)
     use_ema: true          # Use Exponential Moving Average
     ema_decay: 0.999       # EMA decay factor
   
   # Patch embedding settings
   patch:
-    size: 1                # Patch size (kernel_size)
+    size: 2                # Patch size (kernel_size)
     stride: 1              # Patch stride (stride < size = overlapping patches)
     # Examples:
     #   size=1, stride=1: 289 patches (17x17, non-overlapping)
@@ -89,11 +89,15 @@ phase2:
   deepsupervision:
     enabled: true
     num_epochs: 100
-    batch_size: 64
-    learning_rate: 0.0001
+    batch_size: 128
+    learning_rate: 1e-4
     
     # Strategy: "last" (paper), "all" (average), "weighted" (weighted average)
     strategy: "last"
+    
+    # Value network supervision
+    train_value: true              # Train value network with rewards
+    value_weight: 0.5              # Weight for value loss relative to policy loss
     
     # Experience weights
     real_experience_weight: 1.0    # Weight for real experiences
@@ -137,7 +141,7 @@ phase3:
     max_grad_norm: 0.5     # Gradient clipping
     update_epochs: 4       # Number of update epochs
     batch_size: 64         # Batch size for PPO updates
-    learning_rate: 0.0001  # Learning rate
+    learning_rate: 1e-4  # Learning rate
 
 
 # Training Configuration
