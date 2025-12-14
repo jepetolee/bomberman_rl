@@ -386,6 +386,11 @@ class _Shared:
     def build_rule_helper(self, logger):
         module = self.ensure_rule_module()
         helper = SimpleNamespace(logger=logger)
+        # 일부 rule 모듈이 helper.build_rule_helper를 기대하므로 self 참조를 연결
+        try:
+            helper.build_rule_helper = self.build_rule_helper  # compatibility
+        except Exception:
+            pass
         module.setup(helper)
         return helper
 
