@@ -495,10 +495,10 @@ def act(self, game_state: dict) -> str:
         cat = torch.distributions.Categorical(logits=logits)
 
         if self.train:
-            # 강제 teacher 사용: 무조건 teacher를 호출하고, 반환되면 마스크 무시하고 그대로 적용
+            # 강제 teacher 사용: 무조건 teacher 호출, 반환되면 마스크 무시하고 그대로 적용
             eps = SHARED.current_epsilon()  # 로그용
             round_num = game_state.get('round', 0)
-            log_path = "/tmp/act_debug.log"
+            log_path = os.path.abspath("act_debug.log")  # 워크디렉토리 기준
             if step <= 5:
                 try:
                     with open(log_path, 'a') as f:
@@ -506,6 +506,8 @@ def act(self, game_state: dict) -> str:
                         f.flush()
                 except Exception:
                     pass
+                # 콘솔에도 한 줄
+                print(f"[PPO Debug] R={round_num} S={step} eps={eps:.3f} train={self.train}", flush=True)
 
             teacher_action_idx = None
             teacher_action = None
@@ -519,6 +521,7 @@ def act(self, game_state: dict) -> str:
                         f.flush()
                 except Exception:
                     pass
+                print(f"[PPO Teacher] Got action: {teacher_action}", flush=True)
                 if teacher_action in ACTIONS:
                     teacher_action_idx = ACTIONS.index(teacher_action)
             except Exception as e:
@@ -530,6 +533,7 @@ def act(self, game_state: dict) -> str:
                         f.flush()
                 except Exception:
                     pass
+                print(f"[PPO Teacher] Error: {e}", flush=True)
                 teacher_action_idx = None
 
             if teacher_action_idx is not None:
@@ -541,8 +545,9 @@ def act(self, game_state: dict) -> str:
                         f.flush()
                 except Exception:
                     pass
+                print(f"[PPO Agent] Using teacher action={teacher_action} (forced)", flush=True)
             else:
-                # teacher가 실패했거나 잘못된 액션이면: 마스크된 유효 액션 중 랜덤 -> 없으면 폴리시 샘플
+                # teacher 실패: 마스크된 유효 액션 중 랜덤 -> 없으면 폴리시 샘플
                 valid_idxs = [i for i, v in enumerate(logits.squeeze(0)) if v > -1e8]
                 if valid_idxs:
                     action_idx = int(random.choice(valid_idxs))
@@ -552,6 +557,7 @@ def act(self, game_state: dict) -> str:
                             f.flush()
                     except Exception:
                         pass
+                    print("[PPO Agent] Teacher invalid -> random valid action", flush=True)
                 else:
                     action_idx = int(cat.sample().item())
                     try:
@@ -560,6 +566,7 @@ def act(self, game_state: dict) -> str:
                             f.flush()
                     except Exception:
                         pass
+                    print("[PPO Agent] No valid actions -> policy sample", flush=True)
         else:
             action_idx = int(torch.argmax(logits, dim=-1).item())
 
