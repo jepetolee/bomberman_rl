@@ -499,7 +499,7 @@ def act(self, game_state: dict) -> str:
                 logits, value, _ = self.policy.forward_with_z(x, z_prev=None)
                 self._last_z_prev = None
         else:
-            logits, value = self.policy(x)  
+            logits, value = self.policy(x)
             self._last_z_prev = None
         
         # Mask unsafe actions (tiles about to explode)
@@ -530,8 +530,13 @@ def act(self, game_state: dict) -> str:
             teacher_action = None
             try:
                 rule_module = SHARED.ensure_rule_module()
-                # Build a minimal helper; some rule agents expect build_rule_helper attr
-                helper = SimpleNamespace(logger=self.logger)
+                # Build helper with dummy logger and build_rule_helper attr for compatibility
+                class _DummyLogger:
+                    def debug(self,*a,**k): pass
+                    def info(self,*a,**k): pass
+                    def warning(self,*a,**k): pass
+                    def error(self,*a,**k): pass
+                helper = SimpleNamespace(logger=self.logger or _DummyLogger())
                 helper.build_rule_helper = lambda *_args, **_kwargs: helper
                 try:
                     rule_module.setup(helper)
@@ -548,15 +553,15 @@ def act(self, game_state: dict) -> str:
                 if teacher_action in ACTIONS:
                     teacher_action_idx = ACTIONS.index(teacher_action)
             except Exception as e:
+                import traceback
+                err_txt = f"[PPO Teacher] Error: {e}\n{traceback.format_exc()}"
                 try:
                     with open(log_path, 'a') as f:
-                        f.write(f"[PPO Teacher] Error: {e}\n")
-                        import traceback
-                        f.write(traceback.format_exc())
+                        f.write(err_txt + "\n")
                         f.flush()
                 except Exception:
                     pass
-                print(f"[PPO Teacher] Error: {e}", flush=True)
+                print(err_txt, flush=True)
                 teacher_action_idx = None
 
             if teacher_action_idx is not None:
@@ -582,7 +587,7 @@ def act(self, game_state: dict) -> str:
                         pass
                     print("[PPO Agent] Teacher invalid -> random valid action", flush=True)
                 else:
-                    action_idx = int(cat.sample().item())
+            action_idx = int(cat.sample().item())
                     try:
                         with open(log_path, 'a') as f:
                             f.write("[PPO Agent] No valid actions -> policy sample\n")

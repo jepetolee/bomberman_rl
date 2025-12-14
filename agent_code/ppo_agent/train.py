@@ -452,11 +452,11 @@ def _update_env_model():
     
     # Save/load env_model for cross-rank sharing (file-based sync)
     rank, world_size = _get_rank_world_size_from_env()
-    env_model_path = os.path.join(os.path.dirname(SHARED.model_path), 'env_model.pt')
+        env_model_path = os.path.join(os.path.dirname(SHARED.model_path), 'env_model.pt')
     try:
         os.makedirs(os.path.dirname(env_model_path), exist_ok=True)
         if rank == 0:
-            torch.save(SHARED.env_model.state_dict(), env_model_path)
+        torch.save(SHARED.env_model.state_dict(), env_model_path)
             SHARED._env_model_mtime = os.path.getmtime(env_model_path)
         else:
             # For non-zero ranks, reload if a newer file exists
@@ -1157,7 +1157,7 @@ def _ppo_update(use_deep_supervision=False):
                 # NaN/Inf guard on logits and values
                 logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
                 values_pred = torch.nan_to_num(values_pred, nan=0.0, posinf=0.0, neginf=0.0)
-
+                
                 dist = torch.distributions.Categorical(logits=logits)
                 new_logps = dist.log_prob(mb_actions)
                 entropy = dist.entropy().mean()
