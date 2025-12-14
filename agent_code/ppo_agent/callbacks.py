@@ -498,7 +498,12 @@ def act(self, game_state: dict) -> str:
             # 강제 teacher 사용: 무조건 teacher 호출, 반환되면 마스크 무시하고 그대로 적용
             eps = SHARED.current_epsilon()  # 로그용
             round_num = game_state.get('round', 0)
-            log_path = os.path.abspath("act_debug.log")  # 워크디렉토리 기준
+            # 확실한 위치에 남긴다: 파일 기준 (agent_code/ppo_agent/act_debug.log)
+            log_path = os.path.join(os.path.dirname(__file__), "act_debug.log")
+            try:
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            except Exception:
+                pass
             if step <= 5:
                 try:
                     with open(log_path, 'a') as f:
