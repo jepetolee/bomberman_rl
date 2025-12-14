@@ -1121,6 +1121,8 @@ def _ppo_update(use_deep_supervision=False):
                 policy_loss = torch.stack(step_policy_losses).mean()
                 value_loss = torch.stack(step_value_losses).mean()
                 
+                # NaN/Inf guard on logits
+                logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
                 # Entropy (use final prediction)
                 dist = torch.distributions.Categorical(logits=logits)
                 entropy = dist.entropy().mean()
@@ -1152,6 +1154,10 @@ def _ppo_update(use_deep_supervision=False):
                     # Standard ViT model
                     logits, values_pred = SHARED.policy(mb_states)
                 
+                # NaN/Inf guard on logits and values
+                logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
+                values_pred = torch.nan_to_num(values_pred, nan=0.0, posinf=0.0, neginf=0.0)
+
                 dist = torch.distributions.Categorical(logits=logits)
                 new_logps = dist.log_prob(mb_actions)
                 entropy = dist.entropy().mean()

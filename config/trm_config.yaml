@@ -196,7 +196,7 @@ env_vars:
   BOMBER_USE_TRM: "0"
   BOMBER_TRM_RECURRENT: "0"
   # Teacher / exploration settings
-  PPO_TEACHER_MODULE: "agent_code.rule_based_agent.callbacks"
+  PPO_TEACHER_MODULE: "agent_code.team_teacher_agent.callbacks"
   PPO_FORCE_TEACHER_ROUNDS: "500"
   PPO_EPS_START: "0.05"
   PPO_EPS_END: "0.001"
