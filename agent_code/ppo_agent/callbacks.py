@@ -495,65 +495,79 @@ def act(self, game_state: dict) -> str:
         cat = torch.distributions.Categorical(logits=logits)
 
         if self.train:
-            # Epsilon-greedy on top of stochastic policy to push more exploration
-            eps = SHARED.current_epsilon()
-            # Debug: Log to file to avoid subprocess buffering issues
+            # 강제 teacher 사용: 무슨 일이 있어도 teacher를 호출하고 가능한 한 그대로 적용
+            eps = SHARED.current_epsilon()  # 로그용으로만 사용
             round_num = game_state.get('round', 0)
-            if step <= 3:  # Log first 3 steps of each round
-                rand_val = random.random()
+            # Always log early steps to file to avoid missing subprocess prints
+            if step <= 5:
                 try:
                     debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
                     with open(debug_log, 'a') as f:
-                        f.write(f"[PPO Debug] Round={round_num} Step={step} Epsilon={eps:.3f} Train={self.train} Random={rand_val:.3f} WillUseTeacher={rand_val < eps}\n")
+                        f.write(f"[PPO Debug] Round={round_num} Step={step} Eps={eps:.3f} Train={self.train}\n")
                         f.flush()
                 except Exception:
                     pass
-            if random.random() < eps:
-                # Try teacher (rule-based) action first
-                teacher_action_idx = None
-                teacher_action = None
-                try:
-                    # Ensure rule module is loaded via SHARED
-                    rule_module = SHARED.ensure_rule_module()
-                    helper = self.build_rule_helper(self.logger)
-                    teacher_action = rule_module.act(helper, game_state)
-                    print(f"[PPO Teacher] Got action: {teacher_action}", flush=True)  # Debug
-                    sys.stdout.flush()
-                    if teacher_action in ACTIONS:
-                        teacher_action_idx = ACTIONS.index(teacher_action)
-                except Exception as e:
-                    # Log error to file
-                    try:
-                        debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
-                        with open(debug_log, 'a') as f:
-                            f.write(f"[PPO Teacher] Error: {e}\n")
-                            import traceback
-                            f.write(traceback.format_exc())
-                            f.flush()
-                    except Exception:
-                        pass
-                    teacher_action_idx = None
 
-                # Valid actions after masking
-                valid_idxs = [i for i, v in enumerate(logits.squeeze(0)) if v > -1e8]
-                if teacher_action_idx is not None and teacher_action_idx in valid_idxs:
-                    action_idx = int(teacher_action_idx)
-                    # Log which teacher action was applied
-                    # Use print for subprocess visibility
-                    # Log to file
-                    try:
-                        debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
-                        with open(debug_log, 'a') as f:
-                            f.write(f"[PPO Agent] Using teacher action={teacher_action} eps={eps:.3f}\n")
-                            f.flush()
-                    except Exception:
-                        pass
-                elif valid_idxs:
-                    action_idx = int(random.choice(valid_idxs))
-                else:
-                    action_idx = int(cat.sample().item())
+            # Try teacher (rule-based) action first (no epsilon gate)
+            teacher_action_idx = None
+            teacher_action = None
+            try:
+                rule_module = SHARED.ensure_rule_module()
+                helper = self.build_rule_helper(self.logger)
+                teacher_action = rule_module.act(helper, game_state)
+                try:
+                    debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
+                    with open(debug_log, 'a') as f:
+                        f.write(f"[PPO Teacher] Got action: {teacher_action}\n")
+                        f.flush()
+                except Exception:
+                    pass
+                if teacher_action in ACTIONS:
+                    teacher_action_idx = ACTIONS.index(teacher_action)
+            except Exception as e:
+                # Log error to file
+                try:
+                    debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
+                    with open(debug_log, 'a') as f:
+                        f.write(f"[PPO Teacher] Error: {e}\n")
+                        import traceback
+                        f.write(traceback.format_exc())
+                        f.flush()
+                except Exception:
+                    pass
+                teacher_action_idx = None
+
+            # Valid actions after masking
+            valid_idxs = [i for i, v in enumerate(logits.squeeze(0)) if v > -1e8]
+            if teacher_action_idx is not None and teacher_action_idx in valid_idxs:
+                action_idx = int(teacher_action_idx)
+                try:
+                    debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
+                    with open(debug_log, 'a') as f:
+                        f.write(f"[PPO Agent] Using teacher action={teacher_action} (forced)\n")
+                        f.flush()
+                except Exception:
+                    pass
+            elif valid_idxs:
+                # Teacher invalid/masked: still respect mask, choose random valid
+                action_idx = int(random.choice(valid_idxs))
+                try:
+                    debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
+                    with open(debug_log, 'a') as f:
+                        f.write("[PPO Agent] Teacher invalid/masked -> random valid action\n")
+                        f.flush()
+                except Exception:
+                    pass
             else:
+                # Fallback to policy sample (should be rare if mask nuked everything)
                 action_idx = int(cat.sample().item())
+                try:
+                    debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
+                    with open(debug_log, 'a') as f:
+                        f.write("[PPO Agent] No valid actions after mask -> policy sample\n")
+                        f.flush()
+                except Exception:
+                    pass
         else:
             action_idx = int(torch.argmax(logits, dim=-1).item())
 
