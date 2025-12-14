@@ -3,12 +3,10 @@
 Phase 2 Training: Dyna-Q Planning + DeepSupervision
 ====================================================
 
-1. Train environment model on collected teacher data
-2. Use Dyna-Q planning to generate simulated experiences
-3. Train Policy Network with DeepSupervision on real + simulated data
+1. Use Dyna-Q planning to generate simulated experiences (requires pre-trained env model)
+2. Train Policy Network with DeepSupervision on real + simulated data
 
 Usage:
-    python train_phase2.py --train-env-model
     python train_phase2.py --train-policy --use-planning
 """
 
@@ -30,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import settings as s
 from config.load_config import load_config, get_phase2_config, get_model_config, create_model_from_config, apply_config_to_env
-from agent_code.ppo_agent.models.environment_model import EnvironmentModel, create_env_model
+from agent_code.ppo_agent.models.environment_model import create_env_model
 from agent_code.ppo_agent.models.vit_trm import PolicyValueViT_TRM
 from agent_code.ppo_agent.dyna_planning import DynaPlanner, VisitedStatesBuffer
 from agent_code.ppo_agent.train_deepsup import train_policy_deepsup, train_with_simulated_experiences, create_policy_optimizer
@@ -104,91 +102,6 @@ def extract_transitions(episodes: List[Dict]) -> Tuple[torch.Tensor, torch.Tenso
     return states_tensor, actions_tensor, rewards_tensor, next_states_tensor
 
 
-def train_env_model(
-    data_dir: str,
-    model_path: str,
-    num_epochs: int = 50,
-    batch_size: int = 128,
-    lr: float = 1e-3,
-    device: torch.device = None,
-):
-    """Train environment model on teacher data"""
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    print(f"Training environment model on device: {device}")
-    
-    # Load episodes
-    episodes = load_all_episodes(data_dir)
-    if len(episodes) == 0:
-        raise ValueError(f"No episodes found in {data_dir}")
-    
-    # Extract transitions
-    states, actions, rewards, next_states = extract_transitions(episodes)
-    
-    print(f"Loaded {len(states)} transitions")
-    
-    # Create model
-    model = EnvironmentModel(
-        state_channels=9,
-        state_height=s.ROWS,
-        state_width=s.COLS,
-        num_actions=len(ACTIONS),
-        hidden_dim=256,
-    ).to(device)
-    
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion_state = nn.MSELoss()
-    criterion_reward = nn.MSELoss()
-    
-    # Data loader
-    dataset = torch.utils.data.TensorDataset(states, actions, rewards, next_states)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-    # Training loop
-    model.train()
-    for epoch in range(num_epochs):
-        total_state_loss = 0.0
-        total_reward_loss = 0.0
-        num_batches = 0
-        
-        for batch_states, batch_actions, batch_rewards, batch_next_states in dataloader:
-            batch_states = batch_states.to(device)
-            batch_actions = batch_actions.to(device)
-            batch_rewards = batch_rewards.to(device)
-            batch_next_states = batch_next_states.to(device)
-            
-            # Forward
-            next_state_pred, reward_pred = model(batch_states, batch_actions)
-            
-            # Losses
-            state_loss = criterion_state(next_state_pred, batch_next_states)
-            reward_loss = criterion_reward(reward_pred, batch_rewards)
-            loss = state_loss + reward_loss
-            
-            # Backward
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            total_state_loss += state_loss.item()
-            total_reward_loss += reward_loss.item()
-            num_batches += 1
-        
-        avg_state_loss = total_state_loss / num_batches
-        avg_reward_loss = total_reward_loss / num_batches
-        
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs} | "
-                  f"State Loss: {avg_state_loss:.4f} | "
-                  f"Reward Loss: {avg_reward_loss:.4f}")
-    
-    # Save model
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    torch.save(model.state_dict(), model_path)
-    print(f"Saved environment model to {model_path}")
-
-
 def train_policy_with_planning(
     data_dir: str,
     env_model_path: Optional[str],
@@ -224,14 +137,33 @@ def train_policy_with_planning(
     # Load environment model (if planning is enabled)
     env_model = None
     if env_model_path is not None:
-        env_model = create_env_model(
-            state_channels=10,  # Updated to match state_to_features output
-            state_height=s.ROWS,
-            state_width=s.COLS,
-            num_actions=len(ACTIONS),
-            model_path=env_model_path,
-            device=device,
-        )
+        try:
+            env_model = create_env_model(
+                state_channels=10,  # Updated to match state_to_features output
+                state_height=s.ROWS,
+                state_width=s.COLS,
+                num_actions=len(ACTIONS),
+                model_path=env_model_path,
+                device=device,
+            )
+            # Verify model loaded successfully by checking if it has trained weights
+            # (if load failed, model would be randomly initialized)
+            if env_model is not None:
+                # Quick test forward pass to ensure model works
+                test_input = torch.randn(1, 10, s.ROWS, s.COLS).to(device)
+                test_action = torch.tensor([0], device=device)
+                with torch.no_grad():
+                    test_next_state, test_reward = env_model(test_input, test_action)
+                    if torch.isnan(test_next_state).any() or torch.isnan(test_reward).any():
+                        print("Warning: Environment model produces NaN outputs. Using randomly initialized model.")
+                        env_model = None
+                    elif torch.isinf(test_next_state).any() or torch.isinf(test_reward).any():
+                        print("Warning: Environment model produces Inf outputs. Using randomly initialized model.")
+                        env_model = None
+        except Exception as e:
+            print(f"Warning: Failed to load environment model from {env_model_path}: {e}")
+            print("  Simulated experiences will not be generated. Continuing without planning.")
+            env_model = None
     
     # Create Dyna planner (if planning is enabled)
     planner = None
@@ -242,27 +174,44 @@ def train_policy_with_planning(
         
         # Populate visited states from real episodes
         print("Populating visited states buffer...")
+        states_added = 0
         for episode in episodes:
             states = episode['states']
             actions = episode['teacher_actions']
             for state, action in zip(states, actions):
-                state_tensor = torch.from_numpy(state).float()
-                planner.add_experience(state_tensor, int(action))
+                try:
+                    state_tensor = torch.from_numpy(state).float()
+                    planner.add_experience(state_tensor, int(action))
+                    states_added += 1
+                except Exception as e:
+                    # Skip invalid states/actions
+                    continue
         
-        print(f"Visited states buffer size: {len(visited_states)}")
+        print(f"Visited states buffer size: {len(visited_states)} (added {states_added} states)")
+        
+        if len(visited_states) == 0:
+            print("Warning: Visited states buffer is empty! Simulated experiences cannot be generated.")
+            planner = None
     
     # Create policy model from config
     # strict_yaml=True: YAML 설정을 엄격하게 따르고, 기본값을 사용하지 않음
     model = create_model_from_config(config, device=device, strict_yaml=True)
+    try:
+        model_type = get_model_config(config).get('type', 'unknown')
+        print(f"[Phase2] Model created. config.type={model_type}, class={model.__class__.__name__}")
+    except Exception:
+        pass
     
     # Check model type to determine if DeepSupervision is used
     from agent_code.ppo_agent.models.vit_trm import PolicyValueViT_TRM_Hybrid
     from agent_code.ppo_agent.models.vit import PolicyValueViT
-    from agent_code.ppo_agent.models.efficient_gtrxl import PolicyValueEfficientGTrXL
+    from agent_code.ppo_agent.models.efficient_gtrxl import PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL
     is_vit_only = isinstance(model, PolicyValueViT)
     is_efficient_gtrxl = isinstance(model, PolicyValueEfficientGTrXL)
+    is_recursive_gtrxl = isinstance(model, PolicyValueRecursiveGTrXL)
     is_hybrid = isinstance(model, PolicyValueViT_TRM_Hybrid)
-    use_deepsup = not (is_vit_only or is_efficient_gtrxl)  # Only TRM models use DeepSupervision
+    # RecursiveGTrXL and TRM models use DeepSupervision
+    use_deepsup = not (is_vit_only or is_efficient_gtrxl)
     
     optimizer = create_policy_optimizer(model, lr=lr)
     
@@ -284,8 +233,10 @@ def train_policy_with_planning(
     model.train()
     
     # Calculate number of batches per epoch
+    # Use smaller effective batch size since we split between real and simulated
     num_real_samples = len(states)
-    num_batches_per_epoch = max(1, num_real_samples // batch_size)
+    real_batch_size = int(batch_size * 0.75)  # 75% for real data
+    num_batches_per_epoch = max(1, num_real_samples // real_batch_size)
     
     print(f"Training configuration:")
     print(f"  - Model type: {model.__class__.__name__}")
@@ -295,7 +246,10 @@ def train_policy_with_planning(
     if use_deepsup:
         print(f"  - DeepSupervision steps (n_sup): {n_sup} (TRM 모델용)")
     else:
-        print(f"  - DeepSupervision: 사용 안 함 (표준 지도학습, n_sup 파라미터 무시)")
+        if is_recursive_gtrxl:
+            print(f"  - DeepSupervision: 사용 안 함 (RecursiveGTrXL은 내부적으로 재귀 수행, 표준 지도학습)")
+        else:
+            print(f"  - DeepSupervision: 사용 안 함 (표준 지도학습, n_sup 파라미터 무시)")
     print(f"  - Strategy: {strategy}")
     
     for epoch in range(num_epochs):
@@ -326,22 +280,32 @@ def train_policy_with_planning(
         
         # Process batches
         for batch_idx in range(num_batches_per_epoch):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, num_real_samples)
+            real_batch_size_effective = int(batch_size * 0.75)  # 75% for real data
+            start_idx = batch_idx * real_batch_size_effective
+            end_idx = min(start_idx + real_batch_size_effective, num_real_samples)
             
-            # Get real batch
-            batch_real_indices = real_indices[start_idx:end_idx]
+            # Get real batch (use 75% of batch size, leaving 25% for simulated data)
+            real_batch_size = int(batch_size * 0.75)  # 75% real, 25% simulated
+            real_batch_end = min(start_idx + real_batch_size, num_real_samples)
+            batch_real_indices = real_indices[start_idx:real_batch_end]
             real_batch_states = states[batch_real_indices].to(device)
             real_batch_actions = actions[batch_real_indices].to(device)
             real_batch_rewards = rewards[batch_real_indices].to(device) if rewards is not None else None
             
             # Get simulated batch (if available)
+            # Use fixed proportion for simulated data (25% of batch size)
             if len(sim_states_all) > 0:
-                num_sim_in_batch = min(batch_size - len(batch_real_indices), len(sim_states_all))
-                sim_batch_indices = torch.randperm(len(sim_states_all))[:num_sim_in_batch]
-                sim_batch_states = sim_states_all[sim_batch_indices].to(device)
-                sim_batch_actions = sim_actions_all[sim_batch_indices].to(device)
-                sim_batch_rewards = sim_rewards_all[sim_batch_indices].to(device) if sim_rewards_all is not None else None
+                sim_batch_size_fixed = int(batch_size * 0.25)  # Fixed 25% for simulated data
+                sim_batch_size = min(sim_batch_size_fixed, len(sim_states_all))  # Don't exceed available sim data
+                if sim_batch_size > 0:
+                    sim_batch_indices = torch.randperm(len(sim_states_all))[:sim_batch_size]
+                    sim_batch_states = sim_states_all[sim_batch_indices].to(device)
+                    sim_batch_actions = sim_actions_all[sim_batch_indices].to(device)
+                    sim_batch_rewards = sim_rewards_all[sim_batch_indices].to(device) if sim_rewards_all is not None else None
+                else:
+                    sim_batch_states = torch.empty(0, 10, s.ROWS, s.COLS).to(device)
+                    sim_batch_actions = torch.empty(0, dtype=torch.long).to(device)
+                    sim_batch_rewards = None
             else:
                 sim_batch_states = torch.empty(0, 10, s.ROWS, s.COLS).to(device)
                 sim_batch_actions = torch.empty(0, dtype=torch.long).to(device)
@@ -397,7 +361,6 @@ def train_policy_with_planning(
 def main():
     parser = argparse.ArgumentParser(description='Phase 2: Dyna-Q Planning + DeepSupervision')
     parser.add_argument('--config', type=str, default='config/trm_config.yaml', help='Path to YAML config file')
-    parser.add_argument('--train-env-model', action='store_true', help='Train environment model')
     parser.add_argument('--train-policy', action='store_true', help='Train policy with DeepSupervision')
     parser.add_argument('--use-planning', action='store_true', help='Use Dyna-Q planning (requires trained env model)')
     parser.add_argument('--data-dir', type=str, default=None, help='Directory with teacher episodes (overrides config)')
@@ -444,16 +407,6 @@ def main():
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
-    if args.train_env_model:
-        env_model_cfg = phase2_cfg.get('env_model', {})
-        train_env_model(
-            data_dir=data_dir,
-            model_path=env_model_path,
-            num_epochs=env_model_cfg.get('num_epochs', 50),
-            batch_size=env_model_cfg.get('batch_size', 128),
-            lr=float(env_model_cfg.get('learning_rate', 1e-3)),
-        )
     
     if args.train_policy:
         use_planning = args.use_planning or planning_cfg.get('enabled', False)

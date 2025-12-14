@@ -70,13 +70,14 @@ class PolicyAsEnvModel(nn.Module):
         B = state.shape[0]
         
         # Get features from policy model
-        # For EfficientGTrXL: use forward_features (CNN + GTrXL features)
+        # For EfficientGTrXL / RecursiveGTrXL: use forward_features (CNN + GTrXL features)
         # For TRM Hybrid: use ViT features only (TRM not used in env_model)
         from .models.vit_trm import PolicyValueViT_TRM_Hybrid
-        from .models.efficient_gtrxl import PolicyValueEfficientGTrXL
+        from .models.efficient_gtrxl import PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL
         
-        if isinstance(self.policy_model, PolicyValueEfficientGTrXL):
-            # EfficientGTrXL: use forward_features (CNN + GTrXL, all learned)
+        if isinstance(self.policy_model, (PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL)):
+            # EfficientGTrXL / RecursiveGTrXL: use forward_features (CNN + GTrXL, all learned)
+            # RecursiveGTrXL의 재귀는 내부적으로 자동 처리됨
             features = self.policy_model.forward_features(state)  # [B, embed_dim]
         elif isinstance(self.policy_model, PolicyValueViT_TRM_Hybrid):
             # Hybrid model: ViT features만 사용 (TRM은 사용 안함)
@@ -220,19 +221,49 @@ def setup_training(self):
             # Env model: ViT + Policy head + Value head 학습, TRM은 frozen
             import copy
             try:
-                # Deep copy policy model as base for env_model
+                # Try to load existing env_model first (if it was saved previously)
+                # This ensures env_model learning accumulates across rounds/subprocesses
+                env_model_path = os.path.join(os.path.dirname(SHARED.model_path), 'env_model.pt')
+                env_model_exists = os.path.exists(env_model_path)
+                
+                # Wrap policy model as environment model (structure)
                 env_policy_base = copy.deepcopy(SHARED.policy)
                 env_policy_base.train()  # Start in train mode for updates
-                
-                # Wrap policy model as environment model
                 SHARED.env_model = PolicyAsEnvModel(env_policy_base).to(SHARED.device)
                 SHARED.env_model.train()  # Start in train mode for updates
                 
+                # Try to load existing env_model weights (if available)
+                if env_model_exists:
+                    try:
+                        # Load existing env_model state_dict
+                        env_model_state = torch.load(env_model_path, map_location=SHARED.device, weights_only=True)
+                        # Load into env_model (this will load policy_model, next_state_head, reward_head weights)
+                        missing, unexpected = SHARED.env_model.load_state_dict(env_model_state, strict=False)
+                        try:
+                            self.logger.info(
+                                f"[Env Model] Loaded existing env_model from {env_model_path} "
+                                f"(missing={len(missing)}, unexpected={len(unexpected)})"
+                            )
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        # If loading fails, fall back to using fresh copy from policy
+                        try:
+                            self.logger.warning(f"[Env Model] Failed to load {env_model_path}: {e}, using fresh copy from policy")
+                        except Exception:
+                            pass
+                else:
+                    # First time: start with policy model weights (already copied above)
+                    try:
+                        self.logger.info(f"[Env Model] Creating new env_model (copied from policy)")
+                    except Exception:
+                        pass
+                
                 # Setup env_model optimizer
                 from .models.vit_trm import PolicyValueViT_TRM_Hybrid
-                from .models.efficient_gtrxl import PolicyValueEfficientGTrXL
+                from .models.efficient_gtrxl import PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL
                 
-                if isinstance(env_policy_base, PolicyValueEfficientGTrXL):
+                if isinstance(env_policy_base, (PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL)):
                     # EfficientGTrXL: 모든 파라미터 학습 (CNN backbone + GTrXL + heads)
                     # Env model heads만 추가로 학습
                     env_trainable_params = list(SHARED.env_model.policy_model.parameters())
@@ -243,8 +274,9 @@ def setup_training(self):
                     SHARED.env_optimizer = optim.Adam(env_trainable_params, lr=1e-3)
                     
                     try:
+                        model_name = "RecursiveGTrXL" if isinstance(env_policy_base, PolicyValueRecursiveGTrXL) else "EfficientGTrXL"
                         self.logger.info(
-                            f"[Env Model] EfficientGTrXL: All parameters trainable "
+                            f"[Env Model] {model_name}: All parameters trainable "
                             f"({sum(p.numel() for p in env_trainable_params):,} params)"
                         )
                     except Exception:
@@ -403,6 +435,17 @@ def _update_env_model():
         SHARED.env_optimizer.step()
     
     SHARED.env_model.eval()  # Switch back to eval for planning
+    
+    # Save env_model state so it persists across rounds/subprocesses
+    # This ensures env_model learning accumulates across subprocesses/rounds
+    try:
+        env_model_path = os.path.join(os.path.dirname(SHARED.model_path), 'env_model.pt')
+        os.makedirs(os.path.dirname(env_model_path), exist_ok=True)
+        # Save full env_model state_dict (includes policy_model + next_state_head + reward_head)
+        torch.save(SHARED.env_model.state_dict(), env_model_path)
+    except Exception:
+        # Silently ignore save errors (don't break training)
+        pass
 
 
 def _run_planning_updates(logger=None):
@@ -429,13 +472,16 @@ def _run_planning_updates(logger=None):
     model = SHARED.policy
     env_model = SHARED.env_model
     
-    # Get n_sup for Deep Supervision (ViT Only and EfficientGTrXL models do not use DeepSupervision)
-    # Use model's n_sup if available, otherwise default to 4
+    # Get n_sup for Deep Supervision
+    # RecursiveGTrXL: 재귀는 내부적으로 처리되므로 표준 forward 사용 (DeepSupervision 불필요)
+    # ViT Only / EfficientGTrXL: 표준 forward 사용
+    # TRM Hybrid: forward_with_z를 사용한 DeepSupervision 지원
     from .models.vit_trm import PolicyValueViT_TRM_Hybrid
     from .models.vit import PolicyValueViT
-    from .models.efficient_gtrxl import PolicyValueEfficientGTrXL
-    if isinstance(model, PolicyValueViT) or isinstance(model, PolicyValueEfficientGTrXL):
-        # ViT Only or EfficientGTrXL: no DeepSupervision in planning (use standard forward)
+    from .models.efficient_gtrxl import PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL
+    if isinstance(model, (PolicyValueViT, PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL)):
+        # ViT Only, EfficientGTrXL, RecursiveGTrXL: standard forward pass
+        # RecursiveGTrXL은 내부적으로 재귀를 수행하므로 별도 DeepSupervision 불필요
         use_planning_deepsup = False
         planning_n_sup = 1
     elif isinstance(model, PolicyValueViT_TRM_Hybrid):
@@ -475,9 +521,10 @@ def _run_planning_updates(logger=None):
                         # Use improved z for next supervision step
                         z_prev = z_new.detach()  # Detach to prevent long BPTT chains
                 else:
-                    # ViT Only or EfficientGTrXL: standard forward pass (no recursion)
-                    # EfficientGTrXL supports memory but we don't use it in planning (simpler)
-                    if isinstance(model, PolicyValueEfficientGTrXL):
+                    # ViT Only, EfficientGTrXL, or RecursiveGTrXL: standard forward pass
+                    # EfficientGTrXL / RecursiveGTrXL support memory but we don't use it in planning (simpler)
+                    # RecursiveGTrXL의 재귀는 내부적으로 자동 처리됨
+                    if isinstance(model, (PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL)):
                         logits, value = model(state, memory=None)
                     else:
                         logits, value = model(state)
@@ -517,11 +564,13 @@ def _run_planning_updates(logger=None):
         if hasattr(SHARED, "buf_z_prev"):
             SHARED.buf_z_prev = []
 
-        # Use DeepSupervision for Planning updates (only for TRM models, not ViT Only or EfficientGTrXL)
-        # ViT Only and EfficientGTrXL models do not use DeepSupervision
+        # Use DeepSupervision for Planning updates
+        # RecursiveGTrXL: 재귀는 내부적으로 처리되므로 DeepSupervision 불필요
+        # ViT Only / EfficientGTrXL: DeepSupervision 없음
+        # TRM Hybrid: DeepSupervision 사용 (forward_with_z)
         from .models.vit import PolicyValueViT
-        from .models.efficient_gtrxl import PolicyValueEfficientGTrXL
-        use_planning_deepsup = not (isinstance(model, PolicyValueViT) or isinstance(model, PolicyValueEfficientGTrXL))
+        from .models.efficient_gtrxl import PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL
+        use_planning_deepsup = not (isinstance(model, (PolicyValueViT, PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL)))
         _ppo_update(use_deep_supervision=use_planning_deepsup)
 
         # Save updated weights immediately so A3C worker can pick up latest
@@ -529,6 +578,19 @@ def _run_planning_updates(logger=None):
             torch.save(SHARED.policy.state_dict(), SHARED.model_path)
         except Exception:
             pass
+
+    # After all planning rollouts, sync env_model → policy (ViT + heads only; TRM stays frozen)
+    try:
+        from .models.vit_trm import PolicyValueViT_TRM_Hybrid
+        if isinstance(model, PolicyValueViT_TRM_Hybrid) and isinstance(env_model.policy_model, PolicyValueViT_TRM_Hybrid):
+            model.vit.load_state_dict(env_model.policy_model.vit.state_dict(), strict=False)
+            model.pi_head.load_state_dict(env_model.policy_model.pi_head.state_dict(), strict=False)
+            model.v_head.load_state_dict(env_model.policy_model.v_head.state_dict(), strict=False)
+            if logger:
+                logger.info("[Planning] Synced env_model ViT/heads → policy (TRM remains frozen)")
+    except Exception as e:
+        if logger:
+            logger.warning(f"[Planning] Sync env→policy failed: {e}")
 
     try:
         if logger is not None:

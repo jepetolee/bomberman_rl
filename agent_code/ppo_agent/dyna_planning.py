@@ -132,16 +132,32 @@ class DynaPlanner:
             action_batch = torch.tensor(batch_actions, device=self.device)  # [B]
             
             with torch.no_grad():
-                next_state_pred, reward_pred = self.env_model(state_batch, action_batch)
-            
-            # Add to simulated experiences
-            for i in range(len(batch_states)):
-                simulated_experiences.append((
-                    batch_states[i].cpu(),  # Original state
-                    batch_actions[i],       # Action
-                    float(reward_pred[i].item()),  # Predicted reward
-                    next_state_pred[i].cpu(),  # Predicted next state
-                ))
+                try:
+                    next_state_pred, reward_pred = self.env_model(state_batch, action_batch)
+                    
+                    # Check for NaN or Inf values
+                    if torch.isnan(next_state_pred).any() or torch.isnan(reward_pred).any():
+                        # Skip this batch if NaN detected
+                        continue
+                    if torch.isinf(next_state_pred).any() or torch.isinf(reward_pred).any():
+                        # Skip this batch if Inf detected
+                        continue
+                    
+                    # Clamp predictions to reasonable ranges
+                    next_state_pred = torch.clamp(next_state_pred, 0.0, 1.0)  # States should be in [0,1]
+                    reward_pred = torch.clamp(reward_pred, -100.0, 100.0)  # Reasonable reward range
+                    
+                    # Add to simulated experiences
+                    for i in range(len(batch_states)):
+                        simulated_experiences.append((
+                            batch_states[i].cpu(),  # Original state
+                            batch_actions[i],       # Action
+                            float(reward_pred[i].item()),  # Predicted reward
+                            next_state_pred[i].cpu(),  # Predicted next state
+                        ))
+                except Exception as e:
+                    # Skip this batch if prediction fails
+                    continue
         
         return simulated_experiences
     

@@ -574,3 +574,283 @@ class PolicyValueEfficientGTrXL(nn.Module):
         
         return logits, value, new_memory
 
+
+# ============================================================================
+# Recursive GTrXL: "One Block, Many Thoughts"
+# ============================================================================
+
+class PolicyValueRecursiveGTrXL(nn.Module):
+    """
+    Recursive GTrXL: Parameter-Efficient Deep Reasoning
+    
+    Architecture:
+    1. EfficientNetB0-style CNN backbone (spatial feature extraction)
+    2. Feature map → sequence conversion
+    3. **Single** GTrXL Block used recursively (weight sharing)
+    4. Step Embedding to indicate recursion depth
+    5. Separate memory slots for each recursive step
+    6. Policy and Value heads
+    
+    Key idea: Instead of stacking K layers, we use 1 layer K times.
+    This achieves similar depth with ~1/K parameters while maintaining
+    stability through GTrXL's gating mechanism.
+    """
+    def __init__(
+        self,
+        in_channels: int = 10,
+        num_actions: int = 6,
+        img_size: Tuple[int, int] = (17, 17),
+        # CNN parameters
+        cnn_base_channels: int = 32,
+        cnn_width_mult: float = 1.0,
+        # Transformer parameters
+        embed_dim: int = 256,
+        n_layers_simulated: int = 4,  # Number of recursive passes (K in paper)
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        # Memory parameters
+        memory_size: int = 256,  # Memory length for Transformer-XL
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.memory_size = memory_size
+        self.n_layers_simulated = n_layers_simulated
+        
+        # EfficientNetB0-style CNN backbone
+        self.cnn_backbone = EfficientNetBackbone(
+            in_channels=in_channels,
+            base_channels=cnn_base_channels,
+            width_mult=cnn_width_mult,
+            dropout=dropout,
+        )
+        cnn_out_channels = self.cnn_backbone.out_channels
+        
+        # Project CNN features to transformer dimension
+        self.cnn_pool = nn.AdaptiveAvgPool2d((4, 4))  # Fixed 4x4 output
+        self.feature_proj = nn.Linear(cnn_out_channels, embed_dim)
+        
+        # Positional encoding for spatial positions (4x4 = 16 positions)
+        self.pos_embed = nn.Parameter(torch.zeros(1, 16, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
+        # [핵심 1] 단 하나의 GTrXL 블록 (파라미터 공유)
+        self.shared_block = GTrXLBlock(embed_dim, num_heads, mlp_ratio, dropout)
+        
+        # [핵심 2] Step Embedding: 재귀 깊이를 나타내는 임베딩
+        # 각 재귀 단계(k)마다 고유한 임베딩을 더해 모델이 현재 추론 단계를 인식하게 함
+        self.step_embedding = nn.Embedding(n_layers_simulated, embed_dim)
+        nn.init.normal_(self.step_embedding.weight, std=0.02)
+        
+        # Final norm
+        self.final_norm = nn.LayerNorm(embed_dim)
+        
+        # Policy and Value heads
+        hidden = 256
+        self.pi_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, num_actions),
+        )
+        self.v_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+        
+        # Initialize gates to favor identity (for stable training)
+        self._init_gates()
+    
+    def _init_gates(self):
+        """Initialize gates to favor identity (pass-through) for stable training"""
+        # Initialize gate to output ~0.5 (balanced)
+        nn.init.zeros_(self.shared_block.attn_gate.gate_proj.weight)
+        nn.init.zeros_(self.shared_block.mlp_gate.gate_proj.weight)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        memory: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [B, C, H, W] input image
+            memory: [B, M, D] previous memory (optional)
+                    OR [n_layers_simulated, B, M, D] for recursive memory
+        
+        Returns:
+            logits: [B, num_actions]
+            value: [B, 1]
+        """
+        B = x.shape[0]
+        device = x.device
+        
+        # CNN feature extraction
+        cnn_feat = self.cnn_backbone(x)  # [B, C_out, H', W']
+        cnn_feat = self.cnn_pool(cnn_feat)  # [B, C_out, 4, 4]
+        
+        # Convert to sequence: [B, C, 4, 4] -> [B, 16, C]
+        B, C, H, W = cnn_feat.shape
+        cnn_feat = cnn_feat.view(B, C, -1).transpose(1, 2)  # [B, 16, C]
+        
+        # Project to transformer dimension
+        h = self.feature_proj(cnn_feat)  # [B, 16, embed_dim]
+        
+        # Add positional encoding
+        h = h + self.pos_embed
+        
+        # [핵심 3] Recursive Loop (Thinking Process)
+        # 메모리 관리: 각 재귀 단계마다 별도 메모리 슬롯
+        if memory is None:
+            # 처음 실행: 모든 단계의 메모리를 None으로 초기화
+            mems = [None] * self.n_layers_simulated
+        else:
+            # 메모리 형태에 따라 처리
+            if memory.dim() == 3:
+                # [B, M, D] 형태: 모든 단계에서 동일한 메모리 사용
+                mems = [memory] * self.n_layers_simulated
+            elif memory.dim() == 4:
+                # [n_layers_simulated, B, M, D] 형태: 각 단계별 메모리
+                mems = [memory[k] for k in range(self.n_layers_simulated)]
+            else:
+                raise ValueError(f"Invalid memory shape: {memory.shape}")
+        
+        # Recursive inference: 단일 블록을 K번 통과
+        for k in range(self.n_layers_simulated):
+            # A. Step Embedding 추가 ("지금은 k번째 생각 중이야")
+            step_signal = self.step_embedding(
+                torch.tensor(k, device=device)
+            ).unsqueeze(0).unsqueeze(0)  # [1, 1, embed_dim]
+            h = h + step_signal  # [B, 16, embed_dim]
+            
+            # B. 해당 재귀 단계(k)에 맞는 메모리 가져오기
+            mem_k = mems[k]
+            
+            # C. Shared Block 통과 (Recursive Inference)
+            # GTrXLBlock 내부의 Gating이 루프를 돌아도 안정적으로 유지시켜줌
+            h = self.shared_block(h, mem=mem_k)
+        
+        # Final norm
+        h = self.final_norm(h)
+        
+        # Pool sequence to single vector (mean pooling)
+        feat = h.mean(dim=1)  # [B, embed_dim]
+        
+        # Policy and Value
+        logits = self.pi_head(feat)  # [B, num_actions]
+        value = self.v_head(feat)  # [B, 1]
+        
+        return logits, value
+    
+    def forward_features(self, x: torch.Tensor, memory: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Return features before policy/value heads
+        
+        Args:
+            x: [B, C, H, W] input image
+            memory: [B, M, D] previous memory (optional)
+        
+        Returns:
+            feat: [B, embed_dim] pooled feature vector
+        """
+        B = x.shape[0]
+        device = x.device
+        
+        # CNN feature extraction
+        cnn_feat = self.cnn_backbone(x)
+        cnn_feat = self.cnn_pool(cnn_feat)
+        
+        # Convert to sequence
+        B, C, H, W = cnn_feat.shape
+        cnn_feat = cnn_feat.view(B, C, -1).transpose(1, 2)
+        h = self.feature_proj(cnn_feat)
+        h = h + self.pos_embed
+        
+        # Recursive loop
+        if memory is None:
+            mems = [None] * self.n_layers_simulated
+        else:
+            if memory.dim() == 3:
+                mems = [memory] * self.n_layers_simulated
+            elif memory.dim() == 4:
+                mems = [memory[k] for k in range(self.n_layers_simulated)]
+            else:
+                raise ValueError(f"Invalid memory shape: {memory.shape}")
+        
+        for k in range(self.n_layers_simulated):
+            step_signal = self.step_embedding(
+                torch.tensor(k, device=device)
+            ).unsqueeze(0).unsqueeze(0)
+            h = h + step_signal
+            mem_k = mems[k]
+            h = self.shared_block(h, mem=mem_k)
+        
+        h = self.final_norm(h)
+        feat = h.mean(dim=1)
+        
+        return feat
+    
+    def forward_with_memory(
+        self,
+        x: torch.Tensor,
+        memory: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward with memory update (for Transformer-XL style training)
+        
+        Returns:
+            logits: [B, num_actions]
+            value: [B, 1]
+            new_memory: [n_layers_simulated, B, M, D] updated memory for each recursive step
+        """
+        B = x.shape[0]
+        device = x.device
+        
+        # CNN feature extraction
+        cnn_feat = self.cnn_backbone(x)
+        cnn_feat = self.cnn_pool(cnn_feat)
+        
+        # Convert to sequence
+        B, C, H, W = cnn_feat.shape
+        cnn_feat = cnn_feat.view(B, C, -1).transpose(1, 2)
+        h = self.feature_proj(cnn_feat)
+        h = h + self.pos_embed
+        
+        # Initialize memory slots
+        if memory is None:
+            mems = [None] * self.n_layers_simulated
+        else:
+            if memory.dim() == 3:
+                mems = [memory] * self.n_layers_simulated
+            elif memory.dim() == 4:
+                mems = [memory[k] for k in range(self.n_layers_simulated)]
+            else:
+                raise ValueError(f"Invalid memory shape: {memory.shape}")
+        
+        new_mems = []
+        
+        # Recursive inference with memory update
+        for k in range(self.n_layers_simulated):
+            step_signal = self.step_embedding(
+                torch.tensor(k, device=device)
+            ).unsqueeze(0).unsqueeze(0)
+            h = h + step_signal
+            mem_k = mems[k]
+            h = self.shared_block(h, mem=mem_k)
+            
+            # Store current state as memory for this recursive step
+            # Detach to prevent gradients from flowing back through time
+            new_mems.append(h.detach())
+        
+        # Stack memories: [n_layers_simulated, B, T, D]
+        new_memory = torch.stack(new_mems, dim=0)  # [K, B, 16, embed_dim]
+        
+        # Final norm
+        h = self.final_norm(h)
+        feat = h.mean(dim=1)
+        
+        logits = self.pi_head(feat)
+        value = self.v_head(feat)
+        
+        return logits, value, new_memory
+

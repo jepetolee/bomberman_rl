@@ -227,6 +227,11 @@ def create_model(model_path: str, device: torch.device):
         cfg = load_config(cfg_path)
         # strict_yaml=True: YAML 설정을 엄격하게 따르고, 기본값을 사용하지 않음
         model = create_model_from_config(cfg, device=device, strict_yaml=True)
+        try:
+            model_type = cfg.get("model", {}).get("type", "unknown")
+            print(f"[Model] Config type={model_type}, class={model.__class__.__name__}")
+        except Exception:
+            pass
     except Exception as e:
         # Fallback: use env vars or defaults matching YAML (embed_dim=512, depth=6, heads=8)
         from agent_code.ppo_agent.models.vit import PolicyValueViT
@@ -257,34 +262,20 @@ def create_model(model_path: str, device: torch.device):
     if os.path.exists(model_path):
         try:
             state_dict = torch.load(model_path, map_location='cpu', weights_only=True)
-            # Allow partial load for safety across model variants
-            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-            
-            # Check if checkpoint structure matches model structure
-            # If too many keys are missing, the checkpoint is likely from a different architecture
-            if len(missing_keys) > 0:
-                # Check if checkpoint is from a completely different architecture
-                # ViT keys: patch_embed, blocks.X.norm1 (but not cnn_backbone.blocks)
-                # EfficientGTrXL keys: cnn_backbone, gtrxl_blocks, feature_proj
-                checkpoint_has_vit = any('patch_embed' in k or (k.startswith('blocks.') and 'cnn_backbone' not in k) for k in state_dict.keys())
-                checkpoint_has_gtrxl = any('cnn_backbone' in k or 'gtrxl_blocks' in k or 'feature_proj' in k for k in state_dict.keys())
-                model_has_vit = any('patch_embed' in k or (k.startswith('blocks.') and 'cnn_backbone' not in k) for k in model.state_dict().keys())
-                model_has_gtrxl = any('cnn_backbone' in k or 'gtrxl_blocks' in k or 'feature_proj' in k for k in model.state_dict().keys())
-                
-                if (checkpoint_has_vit and model_has_gtrxl) or (checkpoint_has_gtrxl and model_has_vit):
-                    print(f"[WARNING] Checkpoint architecture mismatch detected!")
-                    print(f"  Checkpoint: {'ViT' if checkpoint_has_vit else 'EfficientGTrXL'}")
-                    print(f"  Model: {'ViT' if model_has_vit else 'EfficientGTrXL'}")
-                    print(f"  Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
-                    print(f"  Starting from scratch (checkpoint ignored)")
-                elif len(missing_keys) > len(model.state_dict()) * 0.5:
-                    # More than 50% of keys missing - likely architecture mismatch
-                    print(f"[WARNING] Too many missing keys ({len(missing_keys)}). Starting from scratch.")
-                else:
-                    # Partial load is expected (e.g., only some layers match)
-                    print(f"[INFO] Partial load: {len(missing_keys)} missing, {len(unexpected_keys)} unexpected keys")
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=True)
         except Exception as e:
-            print(f"[WARNING] Failed to load checkpoint: {e}. Starting from scratch.")
+            print(f"[WARNING] Failed to load checkpoint strictly: {e}. Starting from scratch.")
+            missing_keys, unexpected_keys = ["load_failed"], []
+
+        # If any mismatch, ignore checkpoint to avoid wrong architecture loading
+        if missing_keys or unexpected_keys:
+            print(f"[WARNING] Checkpoint ignored due to mismatch. Missing={len(missing_keys)}, Unexpected={len(unexpected_keys)}")
+            model = create_model_from_config(cfg, device=device, strict_yaml=True)
+        else:
+            try:
+                print(f"[Model] Loaded checkpoint '{model_path}' as {model.__class__.__name__}")
+            except Exception:
+                pass
 
     model = model.to(device)
     return model
@@ -317,6 +308,8 @@ def average_model_weights(weight_dicts: List[Dict], global_weights: Optional[Dic
     
     # Combine with global model if provided
     if global_weights is not None and global_weight > 0.0:
+        # Ensure global weights live on CPU to match worker weights (which are sent CPU)
+        global_weights = {k: v.cpu() for k, v in global_weights.items()}
         combined_weights = {}
         worker_weight = 1.0 - global_weight
         for key in avg_worker_weights.keys():
@@ -825,6 +818,13 @@ def run_adaptive_training(config: Dict):
     last_status_check = time.time()
     saves_count = 0
     sync_count = 0
+    # Buffer incoming worker weights between loops so we don't drop them
+    pending_weights = {}
+    # Require at most the available workers (default 2) to sync; override via config
+    min_workers_for_sync = max(
+        1,
+        min(config['num_workers'], config.get('min_workers_for_sync', 2))
+    )
     
     try:
         while True:
@@ -869,21 +869,21 @@ def run_adaptive_training(config: Dict):
                     collected_weights[msg['worker_id']] = msg['weights']
                 except queue.Empty:
                     break
+
+            # Keep collected weights across loops so we can reach the threshold
+            if collected_weights:
+                pending_weights.update(collected_weights)
             
-            # Average weights if we have enough (at least 10 workers)
-            # Wait for sufficient workers to ensure stable averaging
-            min_workers_for_sync = 5
-            if len(collected_weights) > 0:
-                # Log when we have weights but not enough
-                if len(collected_weights) < min_workers_for_sync:
-                    if not hasattr(run_adaptive_training, '_last_weight_log') or \
-                       time.time() - getattr(run_adaptive_training, '_last_weight_log', 0) > 30:
-                        print(f"[Weight Queue] {len(collected_weights)}/{min_workers_for_sync} workers (waiting for more...)")
-                        setattr(run_adaptive_training, '_last_weight_log', time.time())
+            # Average weights if we have enough workers' updates
+            if 0 < len(pending_weights) < min_workers_for_sync:
+                if not hasattr(run_adaptive_training, '_last_weight_log') or \
+                   time.time() - getattr(run_adaptive_training, '_last_weight_log', 0) > 30:
+                    print(f"[Weight Queue] {len(pending_weights)}/{min_workers_for_sync} workers (waiting for more...)")
+                    setattr(run_adaptive_training, '_last_weight_log', time.time())
             
-            if len(collected_weights) >= min_workers_for_sync:
+            if len(pending_weights) >= min_workers_for_sync:
                 sync_count += 1
-                weight_list = list(collected_weights.values())
+                weight_list = list(pending_weights.values())
                 
                 # Get current global model weights for combination
                 current_global_weights = global_model.state_dict()
@@ -901,12 +901,12 @@ def run_adaptive_training(config: Dict):
                 global_model.load_state_dict(avg_weights)
                 torch.save(global_model.state_dict(), config['model_path'])
                 
-                print(f"[Sync {sync_count}] ★ Averaged {len(collected_weights)}/{config['num_workers']} workers "
+                print(f"[Sync {sync_count}] ★ Averaged {len(weight_list)}/{config['num_workers']} workers "
                       f"+ {global_weight_ratio:.0%} global model")
                 print(f"    Global model updated and saved!")
                 
                 # Clear collected weights after processing
-                collected_weights.clear()
+                pending_weights.clear()
                 
                 # No need to signal workers - they check file mtime asynchronously
             

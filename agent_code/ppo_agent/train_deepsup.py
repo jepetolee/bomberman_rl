@@ -17,6 +17,7 @@ import numpy as np
 
 from .models.vit_trm import PolicyValueViT_TRM, PolicyValueViT_TRM_Hybrid
 from .models.vit import PolicyValueViT
+from .models.efficient_gtrxl import PolicyValueRecursiveGTrXL
 
 
 def train_policy_deepsup(
@@ -54,15 +55,16 @@ def train_policy_deepsup(
     
     model.train()
     
-    # Check if model is ViT Only, EfficientGTrXL, hybrid, or original TRM
+    # Check if model is ViT Only, EfficientGTrXL, RecursiveGTrXL, hybrid, or original TRM
     model_class_name = model.__class__.__name__
     is_vit_only = (model_class_name == 'PolicyValueViT')
     is_efficient_gtrxl = (model_class_name == 'PolicyValueEfficientGTrXL')
+    is_recursive_gtrxl = (model_class_name == 'PolicyValueRecursiveGTrXL')
     is_hybrid = (model_class_name == 'PolicyValueViT_TRM_Hybrid')
     
     # Enable/disable gradient for value head based on train_value flag
-    if is_vit_only or is_efficient_gtrxl:
-        # ViT Only or EfficientGTrXL model: standard setup
+    if is_vit_only or is_efficient_gtrxl or is_recursive_gtrxl:
+        # ViT Only, EfficientGTrXL, or RecursiveGTrXL: standard setup
         for param in model.v_head.parameters():
             param.requires_grad = train_value and (rewards is not None)
         for param in model.pi_head.parameters():
@@ -106,12 +108,13 @@ def train_policy_deepsup(
     else:
         train_value = False
     
-    # Check if model is ViT Only, EfficientGTrXL, hybrid, or original TRM
+    # Check if model is ViT Only, EfficientGTrXL, RecursiveGTrXL, hybrid, or original TRM
     from .models.vit_trm import PolicyValueViT_TRM_Hybrid
     from .models.vit import PolicyValueViT
-    from .models.efficient_gtrxl import PolicyValueEfficientGTrXL
+    from .models.efficient_gtrxl import PolicyValueEfficientGTrXL, PolicyValueRecursiveGTrXL
     is_vit_only = isinstance(model, PolicyValueViT)
     is_efficient_gtrxl = isinstance(model, PolicyValueEfficientGTrXL)
+    is_recursive_gtrxl = isinstance(model, PolicyValueRecursiveGTrXL)
     is_hybrid = isinstance(model, PolicyValueViT_TRM_Hybrid)
     
     # ViT Only or EfficientGTrXL model: use standard supervised learning (no DeepSupervision)
@@ -122,6 +125,30 @@ def train_policy_deepsup(
         # Ensure value and rewards have compatible shapes
         if train_value and rewards is not None:
             value_loss = F.mse_loss(value.squeeze(-1), rewards)  # value: [B, 1] -> [B], rewards: [B]
+        else:
+            value_loss = torch.tensor(0.0, device=device)
+        
+        # Backward
+        optimizer.zero_grad()
+        total_loss = policy_loss + value_weight * value_loss
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        return float(policy_loss.item()), float(value_loss.item())
+    
+    # RecursiveGTrXL: Standard supervised learning (no DeepSupervision)
+    # RecursiveGTrXL already performs n_layers_simulated recursive passes internally,
+    # so we don't need additional supervision passes like TRM models.
+    # Simply do a single forward pass - the recursive structure is handled inside the model.
+    if is_recursive_gtrxl:
+        # Single forward pass (model handles recursive inference internally)
+        logits, value = model(states)
+        policy_loss = F.cross_entropy(logits, actions)
+        
+        # Value loss
+        if train_value and rewards is not None:
+            value_loss = F.mse_loss(value.squeeze(-1), rewards)
         else:
             value_loss = torch.tensor(0.0, device=device)
         
@@ -387,8 +414,8 @@ def create_policy_optimizer(model, lr: float = 1e-4) -> torch.optim.Optimizer:
     # Check model type by class name to avoid circular import issues
     model_class_name = model.__class__.__name__
     
-    if model_class_name == 'PolicyValueViT' or model_class_name == 'PolicyValueEfficientGTrXL':
-        # ViT Only or EfficientGTrXL model: train all parameters (policy head included, value head conditionally)
+    if model_class_name == 'PolicyValueViT' or model_class_name == 'PolicyValueEfficientGTrXL' or model_class_name == 'PolicyValueRecursiveGTrXL':
+        # ViT Only, EfficientGTrXL, or RecursiveGTrXL: train all parameters
         policy_params = list(model.parameters())
     elif model_class_name == 'PolicyValueViT_TRM_Hybrid':
         # Hybrid model: train ViT backbone only during pretraining

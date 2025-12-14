@@ -131,7 +131,42 @@ def create_model_from_config(config: Dict[str, Any], device=None, strict_yaml=Tr
     model_cfg = get_model_config(config)
     model_type = model_cfg.get('type', 'vit').lower()
     
-    if model_type == 'efficient_gtrxl':
+    if model_type == 'recursive_gtrxl':
+        # Recursive GTrXL: Single block used recursively
+        from agent_code.ppo_agent.models.efficient_gtrxl import PolicyValueRecursiveGTrXL
+        rec_cfg = model_cfg.get('recursive_gtrxl', {})
+        
+        # Strict mode: require all parameters in YAML
+        if strict_yaml:
+            required_keys = ['cnn_base_channels', 'cnn_width_mult', 'n_layers_simulated', 'num_heads', 'memory_size']
+            missing = [k for k in required_keys if k not in rec_cfg]
+            if missing:
+                raise ValueError(f"YAML에 필수 RecursiveGTrXL 설정이 없습니다: {missing}. "
+                               f"config/trm_config.yaml의 model.recursive_gtrxl 섹션에 명시해야 합니다.")
+            if 'embed_dim' not in model_cfg:
+                raise ValueError("YAML에 embed_dim이 없습니다. config/trm_config.yaml의 model 섹션에 명시해야 합니다.")
+            if 'in_channels' not in model_cfg:
+                raise ValueError("YAML에 in_channels가 없습니다. config/trm_config.yaml의 model 섹션에 명시해야 합니다.")
+            if 'num_actions' not in model_cfg:
+                raise ValueError("YAML에 num_actions가 없습니다. config/trm_config.yaml의 model 섹션에 명시해야 합니다.")
+        
+        model = PolicyValueRecursiveGTrXL(
+            in_channels=model_cfg['in_channels'] if strict_yaml else model_cfg.get('in_channels', 10),
+            num_actions=model_cfg['num_actions'] if strict_yaml else model_cfg.get('num_actions', 6),
+            img_size=tuple(model_cfg.get('img_size', [s.ROWS, s.COLS])),
+            # CNN parameters
+            cnn_base_channels=rec_cfg['cnn_base_channels'] if strict_yaml else rec_cfg.get('cnn_base_channels', 32),
+            cnn_width_mult=rec_cfg['cnn_width_mult'] if strict_yaml else rec_cfg.get('cnn_width_mult', 1.0),
+            # Transformer parameters
+            embed_dim=model_cfg['embed_dim'] if strict_yaml else model_cfg.get('embed_dim', 256),
+            n_layers_simulated=rec_cfg['n_layers_simulated'] if strict_yaml else rec_cfg.get('n_layers_simulated', 4),
+            num_heads=rec_cfg['num_heads'] if strict_yaml else rec_cfg.get('num_heads', 8),
+            mlp_ratio=model_cfg.get('mlp_ratio', 4.0),
+            dropout=model_cfg.get('dropout', 0.0),
+            # Memory
+            memory_size=rec_cfg['memory_size'] if strict_yaml else rec_cfg.get('memory_size', 256),
+        ).to(device)
+    elif model_type == 'efficient_gtrxl':
         # EfficientNetB0 + GTrXL model
         from agent_code.ppo_agent.models.efficient_gtrxl import PolicyValueEfficientGTrXL
         eff_cfg = model_cfg.get('efficient_gtrxl', {})

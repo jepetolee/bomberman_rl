@@ -138,41 +138,24 @@ class _Shared:
                 # strict_yaml=True: YAML 설정을 엄격하게 따르고, 기본값을 사용하지 않음
                 if model_type == 'efficient_gtrxl':
                     self.policy = create_model_from_config(config, device=self.device, strict_yaml=True)
-                    # Skip the rest of the manual model creation
-                    # Load checkpoint if available
+                    try:
+                        print(f"[PPO] Config type={model_cfg.get('type','unknown')}, class={self.policy.__class__.__name__}")
+                    except Exception:
+                        pass
+                    # Load checkpoint strictly; if mismatch, ignore and keep new model
                     reset_requested = os.environ.get("PPO_RESET", "0") == "1"
                     if (not reset_requested) and os.path.isfile(self.model_path):
                         try:
-                            logger.info(f"Loading PPO model from '{self.model_path}'.")
+                            logger.info(f"Loading PPO model from '{self.model_path}' (strict).")
                             state = torch.load(self.model_path, map_location=self.device, weights_only=True)
-                            missing_keys, unexpected_keys = self.policy.load_state_dict(state, strict=False)
-                            
+                            missing_keys, unexpected_keys = self.policy.load_state_dict(state, strict=True)
                             if missing_keys or unexpected_keys:
-                                # Check for architecture mismatch
-                                # ViT keys: patch_embed, blocks.X.norm1 (but not cnn_backbone.blocks)
-                                # EfficientGTrXL keys: cnn_backbone, gtrxl_blocks, feature_proj
-                                checkpoint_has_vit = any('patch_embed' in k or (k.startswith('blocks.') and 'cnn_backbone' not in k) for k in state.keys())
-                                checkpoint_has_gtrxl = any('cnn_backbone' in k or 'gtrxl_blocks' in k or 'feature_proj' in k for k in state.keys())
-                                model_has_vit = any('patch_embed' in k or (k.startswith('blocks.') and 'cnn_backbone' not in k) for k in self.policy.state_dict().keys())
-                                model_has_gtrxl = any('cnn_backbone' in k or 'gtrxl_blocks' in k or 'feature_proj' in k for k in self.policy.state_dict().keys())
-                                
-                                if (checkpoint_has_vit and model_has_gtrxl) or (checkpoint_has_gtrxl and model_has_vit):
-                                    logger.warning(f"Architecture mismatch: Checkpoint is {'ViT' if checkpoint_has_vit else 'EfficientGTrXL'}, "
-                                                 f"but model is {'ViT' if model_has_vit else 'EfficientGTrXL'}. Starting from scratch.")
-                                    # Reinitialize model
-                                    from config.load_config import create_model_from_config
-                                    config = load_config(cfg_path)
-                                    self.policy = create_model_from_config(config, device=self.device, strict_yaml=True)
-                                elif len(missing_keys) > len(self.policy.state_dict()) * 0.5:
-                                    logger.warning(f"Too many missing keys ({len(missing_keys)}/{len(self.policy.state_dict())}). Starting from scratch.")
-                                    # Reinitialize model
-                                    from config.load_config import create_model_from_config
-                                    config = load_config(cfg_path)
-                                    self.policy = create_model_from_config(config, device=self.device, strict_yaml=True)
-                                else:
-                                    logger.info(f"Partial load: {len(missing_keys)} missing, {len(unexpected_keys)} unexpected keys")
+                                logger.warning(f"Checkpoint mismatch: missing={len(missing_keys)}, unexpected={len(unexpected_keys)}. Starting fresh.")
+                                self.policy = create_model_from_config(config, device=self.device, strict_yaml=True)
+                            else:
+                                logger.info(f"Loaded checkpoint '{self.model_path}' as {self.policy.__class__.__name__}")
                         except Exception as e:
-                            logger.warning(f"Failed to load checkpoint: {e}. Starting from scratch.")
+                            logger.warning(f"Failed to load checkpoint strictly: {e}. Starting from scratch.")
                     return
                 trm_cfg = model_cfg.get('trm', {})
                 patch_cfg = model_cfg.get('patch', {})

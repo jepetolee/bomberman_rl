@@ -229,7 +229,8 @@ def act(self, game_state):
             if (0 < i < bomb_map.shape[0]) and (0 < j < bomb_map.shape[1]):
                 bomb_map[i, j] = min(bomb_map[i, j], t)
     
-    # Loop detection
+    # Loop detection (EXACTLY like rule_based_agent)
+    # If agent has been in the same location three times recently, it's a loop
     if self.coordinate_history.count((x, y)) > 2:
         self.ignore_others_timer = 5
     else:
@@ -261,6 +262,28 @@ def act(self, game_state):
     if (bombs_left > 0) and (x, y) not in self.bomb_history:
         valid_actions.append('BOMB')
     
+    # ===== SAFETY CHECK FUNCTIONS =====
+    def has_safe_escape_route(bomb_pos: Tuple[int, int]) -> bool:
+        """폭탄 설치 후 탈출 경로가 있는지 확인"""
+        # 폭탄이 터질 시간(보통 3-4 스텝) 후에도 안전한 타일이 있는지 확인
+        safe_time = 2  # 2스텝 이상 여유가 있어야 함
+        
+        # 현재 위치에서 도달 가능한 안전한 타일 확인
+        escape_candidates = []
+        for tile in valid_tiles:
+            # 폭탄 범위 밖이거나 충분히 시간 여유가 있는 타일
+            tx, ty = tile
+            if bomb_map[tx, ty] > safe_time and tile != bomb_pos:
+                escape_candidates.append(tile)
+        
+        # 탈출 후보가 있으면 탈출 가능
+        return len(escape_candidates) > 0
+    
+    def bomb_safe_for_team() -> bool:
+        if not enemies:
+            return False
+        return not teammate_in_blast((x, y), teammates)
+    
     # ===== BUILD ACTION IDEAS (stack - last added = highest priority) =====
     action_ideas = ['UP', 'DOWN', 'LEFT', 'RIGHT']
     shuffle(action_ideas)
@@ -272,32 +295,39 @@ def act(self, game_state):
                  and ([arena[ix + 1, iy], arena[ix - 1, iy], arena[ix, iy + 1], arena[ix, iy - 1]].count(0) == 1)]
     crates = [(ix, iy) for ix in cols for iy in rows if (arena[ix, iy] == 1)]
     
-    # Partition coins with teammates
-    my_coins = partition_coins(coins, teammates, (x, y))
-    
-    # Build target list based on role
+    # Build target list - OPTIMIZED for coin collection efficiency
+    # Priority: coins > crates > dead_ends > enemies (very conservative)
     targets = []
     
-    # AGGRESSIVE: ALWAYS prioritize enemies first!
-    if enemies and is_attacker:
-        # 공격자는 적 우선, 단 중복 우선도 제거
+    # OPTIMIZATION: Use ALL coins without partition for maximum collection speed
+    # coin_collector_agent doesn't partition - both agents compete naturally
+    # BFS will find closest coin to each agent automatically
+    targets.extend(coins)     # ALL coins - ABSOLUTE highest priority
+    targets.extend(crates)    # Crates second
+    targets.extend(dead_ends) # Dead ends for positioning
+    
+    # VERY CONSERVATIVE: Only add enemies if NO coins/crates available
+    # This is more conservative than rule_based_agent for better coin collection
+    # Matches coin_collector_agent behavior (never targets enemies)
+    if (len(crates) + len(coins) == 0) and enemies:
         targets.extend(enemies)
-        targets.extend(my_coins)
-        targets.extend(crates)
-    else:
-        # 비공격자는 코인/생존 우선
-        targets.extend(my_coins)
-        targets.extend(dead_ends)
-        targets.extend(crates)
     
     # Exclude targets on bombs
     targets = [t for t in targets if t not in bomb_xys]
     
-    # Navigate to targets
+    # Navigate to targets - OPTIMIZED for survival and coin collection
+    # Balance between safety and efficiency (like team_teacher_agent)
     free_space = arena == 0
+    
+    # Only block others when stuck in loop - allows faster coin collection
     if self.ignore_others_timer > 0:
         for o in all_others:
             free_space[o] = False
+    # CRITICAL: Don't block teammates - allows better coordination
+    # Team members can coordinate for faster coin collection
+    for tm in teammates:
+        if tm in all_others:
+            free_space[tm] = True  # Allow teammates to overlap
     
     d = look_for_targets(free_space, (x, y), targets, self.logger)
     if d == (x, y - 1):
@@ -312,260 +342,141 @@ def act(self, game_state):
         action_ideas.append('WAIT')
     
     # ===== BOMB PLACEMENT LOGIC =====
+    # Very conservative bomb placement - only when absolutely safe and effective
     
-    # Bomb at dead end (trap crates)
+    # Bomb at dead end (OPTIMIZED: check safety first for better survival)
+    # Only bomb if we have time to potentially escape (bomb_map shows some safety)
     if (x, y) in dead_ends:
-        action_ideas.append('BOMB')
+        # Check if we have at least some time (bomb_map > 1 means not immediate danger)
+        # This prevents bombing when we're about to die anyway
+        if bomb_map[x, y] > 1:
+            action_ideas.append('BOMB')
     
-    # Bomb next to crate
+    # Bomb next to crate (OPTIMIZED: check safety first)
+    # Only bomb if we're not in immediate danger
     if d == (x, y) and ([arena[x + 1, y], arena[x - 1, y], arena[x, y + 1], arena[x, y - 1]].count(1) > 0):
-        action_ideas.append('BOMB')
+        # Check if we have escape route (safe tiles nearby)
+        safe_nearby = any(bomb_map[nx, ny] > 2 for nx, ny in valid_tiles if (nx, ny) != (x, y))
+        # Only bomb if safe or not in immediate danger
+        if safe_nearby or bomb_map[x, y] > 2:
+            action_ideas.append('BOMB')
     
-    # Bomb: 적이 매우 근접(<=2)하고 시야 확보 + 탈출 가능할 때만
-    if enemies and is_attacker:
-        min_enemy_dist = min(abs(ex - x) + abs(ey - y) for ex, ey in enemies)
-        if min_enemy_dist <= 2:
-            for ex, ey in enemies:
-                if (ex == x or ey == y) and min_enemy_dist <= 2:
-                    blocked = False
-                    if ex == x:
-                        for dy in range(min(y, ey) + 1, max(y, ey)):
-                            if arena[x, dy] != 0:
-                                blocked = True
-                                break
-                    else:
-                        for dx in range(min(x, ex) + 1, max(x, ex)):
-                            if arena[dx, y] != 0:
-                                blocked = True
-                                break
-                    # 탈출 경로 존재 확인: bomb_map>2인 안전 타일이 주변에 있는지 체크
-                    safe_exists = any(bomb_map[nx, ny] > 2 for nx, ny in valid_tiles)
-                    if not blocked and safe_exists and not teammate_in_blast((x, y), teammates):
-                        action_ideas.append('BOMB')
-                        break
-    
-    # AGGRESSIVE: Bomb when touching enemy or very close!
+    # Bomb when touching enemy (OPTIMIZED: check safety first)
+    # Only bomb if safe to do so (team_teacher_agent style - more conservative)
     if enemies:
         min_enemy_dist = min(abs(ex - x) + abs(ey - y) for ex, ey in enemies)
-        # EXTREMELY aggressive: bomb if enemy is within 4 tiles (was 2)
-        if min_enemy_dist <= 4:
+        # Only bomb if enemy is directly adjacent (touching, distance <= 1)
+        if min_enemy_dist <= 1:
+            # Check teammate safety AND have escape route for better survival
             if not teammate_in_blast((x, y), teammates):
-                action_ideas.append('BOMB')
-                action_ideas.append('BOMB')  # Higher priority
-                action_ideas.append('BOMB')  # Even higher priority for aggression
-                action_ideas.append('BOMB')  # Maximum priority
-    
-    # 기존의 먼 거리 폭탄 및 예측 폭탄 로직 제거 → 자살/과잉 폭탄 감소
-    
-    # AGGRESSIVE: Predict enemy movement and bomb ahead
-    if enemies:
-        for ex, ey in enemies:
-            # Predict: if enemy is moving, bomb where they might go
-            # Check if enemy is near a corner or dead end
-            enemy_near_corner = False
-            for dx, dy in [(0, -1), (1, 0), (0, 1), (-1, 0)]:
-                nx, ny = ex + dx, ey + dy
-                if (0 < nx < arena.shape[0] - 1 and 0 < ny < arena.shape[1] - 1):
-                    if arena[nx, ny] != 0:  # Wall or crate
-                        enemy_near_corner = True
-                        break
-            
-            # If enemy is near corner, bomb to trap them
-            if enemy_near_corner:
-                # Find attack position that can hit enemy even if they move
-                for attack_dist in range(1, s.BOMB_POWER + 1):
-                    for pos in [(ex + attack_dist, ey), (ex - attack_dist, ey), 
-                               (ex, ey + attack_dist), (ex, ey - attack_dist)]:
-                        px, py = pos
-                        if (0 < px < arena.shape[0] - 1 and 0 < py < arena.shape[1] - 1 and
-                            arena[px, py] == 0 and pos not in all_others and pos not in bomb_xys):
-                            # Check if we're close to this position
-                            dist_to_pos = abs(px - x) + abs(py - y)
-                            if dist_to_pos <= 3:  # Close enough to attack
-                                # Check line of sight
-                                blocked = False
-                                if px == ex:
-                                    for check_y in range(min(py, ey) + 1, max(py, ey)):
-                                        if arena[ex, check_y] != 0:
-                                            blocked = True
-                                            break
-                                else:
-                                    for check_x in range(min(px, ex) + 1, max(px, ex)):
-                                        if arena[check_x, ey] != 0:
-                                            blocked = True
-                                            break
-                                if not blocked and not teammate_in_blast((px, py), teammates):
-                                    # Navigate to this position
-                                    next_step = a_star_to_target((x, y), pos, arena, bomb_map, all_others, bomb_xys_set)
-                                    if next_step:
-                                        nx, ny = next_step
-                                        if nx == x - 1:
-                                            action_ideas.append('LEFT')
-                                        elif nx == x + 1:
-                                            action_ideas.append('RIGHT')
-                                        elif ny == y - 1:
-                                            action_ideas.append('UP')
-                                        elif ny == y + 1:
-                                            action_ideas.append('DOWN')
-                                    # If already at position, bomb
-                                    if dist_to_pos <= 1:
-                                        action_ideas.append('BOMB')
-                                    break
-                if action_ideas and action_ideas[-1] in ['LEFT', 'RIGHT', 'UP', 'DOWN', 'BOMB']:
-                    break
-    
-    # AGGRESSIVE: Navigate towards attack position on enemy (ALL agents attack)
-    if enemies:  # Removed is_attacker check - all agents hunt
-        closest_enemy = min(enemies, key=lambda e: abs(e[0] - x) + abs(e[1] - y))
-        ex, ey = closest_enemy
-        enemy_dist = abs(ex - x) + abs(ey - y)
-        
-        # Check if enemy is cornered (limited escape routes)
-        enemy_escape_routes = 0
-        for dx, dy in [(0, -1), (1, 0), (0, 1), (-1, 0)]:
-            nx, ny = ex + dx, ey + dy
-            if (0 < nx < arena.shape[0] - 1 and 0 < ny < arena.shape[1] - 1 and
-                arena[nx, ny] == 0 and (nx, ny) not in all_others and (nx, ny) not in bomb_xys):
-                enemy_escape_routes += 1
-        
-        enemy_is_cornered = enemy_escape_routes <= 2
-        
-        # TEAM COORDINATION: Check if teammate is also attacking same enemy
-        teammate_attacking = False
-        if teammates:
-            for tx, ty in teammates:
-                teammate_enemy_dist = min(abs(ex - tx) + abs(ey - ty) for ex, ey in enemies) if enemies else 999
-                if teammate_enemy_dist <= 5:  # Teammate is also close to enemy
-                    teammate_attacking = True
-                    break
-        
-        # If enemy is nearby or cornered, or teammate is attacking, try to get into attack position
-        # Increased range for more aggressive hunting (was 8, now 15)
-        # Also attack if teammate is nearby (coordination)
-        if enemy_dist <= 15 or enemy_is_cornered or teammate_attacking:
-            attack_positions = []
-            
-            # Check all positions that can hit the enemy
-            for i in range(1, s.BOMB_POWER + 1):
-                for pos in [(ex + i, ey), (ex - i, ey), (ex, ey + i), (ex, ey - i)]:
-                    px, py = pos
-                    if (0 < px < arena.shape[0] - 1 and 0 < py < arena.shape[1] - 1 and
-                        arena[px, py] == 0 and pos not in all_others and pos not in bomb_xys):
-                        # Check path is clear
-                        blocked = False
-                        if px == ex:  # Same column
-                            for check_y in range(min(py, ey) + 1, max(py, ey)):
-                                if arena[ex, check_y] != 0:
-                                    blocked = True
-                                    break
-                        else:  # Same row
-                            for check_x in range(min(px, ex) + 1, max(px, ex)):
-                                if arena[check_x, ey] != 0:
-                                    blocked = True
-                                    break
-                        if not blocked:
-                            dist = abs(px - x) + abs(py - y)
-                            # Prefer positions where enemy is cornered
-                            priority = dist - (10 if enemy_is_cornered else 0)
-                            attack_positions.append((pos, priority))
-            
-            if attack_positions:
-                attack_positions.sort(key=lambda ap: ap[1])
-                target_pos = attack_positions[0][0]
-                
-                next_step = a_star_to_target((x, y), target_pos, arena, bomb_map, all_others, bomb_xys_set)
-                if next_step:
-                    nx, ny = next_step
-                    if nx == x - 1:
-                        action_ideas.append('LEFT')
-                    elif nx == x + 1:
-                        action_ideas.append('RIGHT')
-                    elif ny == y - 1:
-                        action_ideas.append('UP')
-                    elif ny == y + 1:
-                        action_ideas.append('DOWN')
-        
-        # If at attack position and enemy is cornered, definitely bomb
-        if enemy_is_cornered and enemy_dist <= s.BOMB_POWER:
-            if (ex == x or ey == y):
-                blocked = False
-                if ex == x:
-                    for dy in range(min(y, ey) + 1, max(y, ey)):
-                        if arena[x, dy] != 0:
-                            blocked = True
-                            break
-                else:
-                    for dx in range(min(x, ex) + 1, max(x, ex)):
-                        if arena[dx, y] != 0:
-                            blocked = True
-                            break
-                if not blocked and not teammate_in_blast((x, y), teammates):
+                # Only bomb if we have a safe escape route or touching (mutual kill acceptable)
+                safe_escape = any(bomb_map[nx, ny] > 2 for nx, ny in valid_tiles if (nx, ny) != (x, y))
+                # Allow if touching (mutual kill risk acceptable) or if safe escape exists
+                if safe_escape or min_enemy_dist == 0:
                     action_ideas.append('BOMB')
-                    action_ideas.append('BOMB')  # Very high priority
-        
-        # AGGRESSIVE: If teammate is attacking same enemy, coordinate attack
-        if teammate_attacking and enemy_dist <= s.BOMB_POWER + 1:
-            # Coordinate: if teammate is on one side, we attack from other side
-            if (ex == x or ey == y):
-                blocked = False
-                if ex == x:
-                    for dy in range(min(y, ey) + 1, max(y, ey)):
-                        if arena[x, dy] != 0:
-                            blocked = True
-                            break
-                else:
-                    for dx in range(min(x, ex) + 1, max(x, ex)):
-                        if arena[dx, y] != 0:
-                            blocked = True
-                            break
-                if not blocked and not teammate_in_blast((x, y), teammates):
-                    action_ideas.append('BOMB')
-                    action_ideas.append('BOMB')  # High priority for coordinated attack
     
-    # ===== ESCAPE FROM BOMBS (HIGHEST PRIORITY) =====
+    # REMOVED: Predictive bombing - too risky, causes suicides
+    
+    # REMOVED: Complex attack positioning - too risky, focus on survival first
+    
+    # ===== ESCAPE FROM BOMBS (HIGHEST PRIORITY - SURVIVAL FIRST) =====
+    # OPTIMIZED: More aggressive escape detection for better survival
+    # Check bomb_map for immediate danger and escape early
+    bomb_escape_actions = []
+    
+    # CRITICAL: Check if current position is in danger zone
+    # More sensitive detection: <= 3 means we should start moving immediately
+    # This helps match team_teacher_agent's survival rate
+    current_in_danger = bomb_map[x, y] <= 3  # Start escaping earlier
+    
     for (xb, yb), t in bombs:
+        # Same column - run vertically away (EXACTLY like rule_based: < 4)
         if (xb == x) and (abs(yb - y) < 4):
-            # Same column - run vertically away
-            if (yb > y):
-                action_ideas.append('UP')
-            if (yb < y):
-                action_ideas.append('DOWN')
-            # Turn corner
-            action_ideas.append('LEFT')
-            action_ideas.append('RIGHT')
+            # Run away - HIGHEST priority if in danger
+            if (yb > y) and 'UP' in valid_actions:
+                if current_in_danger:
+                    bomb_escape_actions.append('UP')  # Add to high priority list
+                else:
+                    action_ideas.append('UP')
+            if (yb < y) and 'DOWN' in valid_actions:
+                if current_in_danger:
+                    bomb_escape_actions.append('DOWN')
+                else:
+                    action_ideas.append('DOWN')
+            # Turn corner to escape
+            if 'LEFT' in valid_actions:
+                if current_in_danger:
+                    bomb_escape_actions.append('LEFT')
+                else:
+                    action_ideas.append('LEFT')
+            if 'RIGHT' in valid_actions:
+                if current_in_danger:
+                    bomb_escape_actions.append('RIGHT')
+                else:
+                    action_ideas.append('RIGHT')
+        # Same row - run horizontally away
         if (yb == y) and (abs(xb - x) < 4):
-            # Same row - run horizontally away
-            if (xb > x):
-                action_ideas.append('LEFT')
-            if (xb < x):
-                action_ideas.append('RIGHT')
-            # Turn corner
-            action_ideas.append('UP')
-            action_ideas.append('DOWN')
+            # Run away
+            if (xb > x) and 'LEFT' in valid_actions:
+                if current_in_danger:
+                    bomb_escape_actions.append('LEFT')
+                else:
+                    action_ideas.append('LEFT')
+            if (xb < x) and 'RIGHT' in valid_actions:
+                if current_in_danger:
+                    bomb_escape_actions.append('RIGHT')
+                else:
+                    action_ideas.append('RIGHT')
+            # Turn corner to escape
+            if 'UP' in valid_actions:
+                if current_in_danger:
+                    bomb_escape_actions.append('UP')
+                else:
+                    action_ideas.append('UP')
+            if 'DOWN' in valid_actions:
+                if current_in_danger:
+                    bomb_escape_actions.append('DOWN')
+                else:
+                    action_ideas.append('DOWN')
     
-    # On top of bomb - escape any direction
+    # On top of bomb - escape ANY direction immediately (CRITICAL for survival)
     for (xb, yb), t in bombs:
         if xb == x and yb == y:
-            action_ideas.extend(action_ideas[:4])
+            # Add all valid movement actions to escape list
+            for move in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                if move in valid_actions:
+                    bomb_escape_actions.append(move)
     
-    # ===== TEAMMATE BOMB SAFETY CHECK =====
-    def bomb_safe_for_team() -> bool:
-        if not enemies:
-            return False
-        return not teammate_in_blast((x, y), teammates)
+    # Add escape actions at the END (highest priority) - they will be checked last
+    # This ensures escape takes precedence over everything else
+    action_ideas.extend(bomb_escape_actions)
     
     # ===== SELECT ACTION (last valid wins) =====
     while len(action_ideas) > 0:
         a = action_ideas.pop()
         
-        # Extra safety check for BOMB action - MAXIMUM AGGRESSION
+        # Extra safety check for BOMB action - OPTIMIZED for survival
+        # Additional checks to prevent suicidal bombs
         if a == 'BOMB':
-            # Only check teammate safety - NO escape route check for maximum kills!
+            # 팀원 안전 확인
             if not bomb_safe_for_team():
                 continue
-            # REMOVED all escape route checks - be extremely aggressive!
-            # If there's an enemy nearby, bomb regardless of escape route
-            # This maximizes kill opportunities
+            
+            # OPTIMIZATION: Don't bomb if we're in immediate danger
+            # Check if current position will be hit by explosion soon
+            if bomb_map[x, y] <= 2:  # More conservative: <= 2 means very little time
+                # We're about to die, don't waste bomb
+                continue
+            
+            # OPTIMIZATION: Check if we have at least one safe escape route
+            # This prevents most suicidal bombs while still allowing strategic bombing
+            # More conservative: require bomb_map > 3 for safe escape
+            safe_escape_exists = any(bomb_map[nx, ny] > 3 for nx, ny in valid_tiles if (nx, ny) != (x, y))
+            if not safe_escape_exists:
+                # No safe escape - only allow if touching enemy (mutual kill acceptable)
+                min_enemy_dist = min(abs(ex - x) + abs(ey - y) for ex, ey in enemies) if enemies else 999
+                if min_enemy_dist > 0:  # Not touching enemy
+                    continue  # Skip bomb if no escape and not touching enemy
         
         if a in valid_actions:
             if a == 'BOMB':
