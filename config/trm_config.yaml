@@ -52,9 +52,9 @@ model:
   recursive_gtrxl:
     # CNN backbone parameters
     cnn_base_channels: 64  # Base channels for EfficientNet
-    cnn_width_mult: 1.0    # Width multiplier (like EfficientNet scaling)
+    cnn_width_mult: 2.0    # Width multiplier (like EfficientNet scaling)
     # Recursive GTrXL parameters
-    n_layers_simulated: 8  # Number of recursive passes (K) - 추론 깊이
+    n_layers_simulated: 4  # Number of recursive passes (K) - 추론 깊이
                             # 4~8 권장, 작게 시작할 때는 4로 시작
     num_heads: 8           # Number of attention heads
     memory_size: 256       # Memory length for Transformer-XL
