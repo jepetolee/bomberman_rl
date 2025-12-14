@@ -405,6 +405,13 @@ def setup(self):
     SHARED.ensure_policy(self.train, self.logger)
     self.policy = SHARED.policy  # convenience alias
 
+    # helper.build_rule_helper 를 요구하는 rule 모듈 호환을 위해 self에도 연결
+    try:
+        import types
+        self.build_rule_helper = types.MethodType(build_rule_helper, self)
+    except Exception:
+        pass
+
     # Assign a stable instance id for multi-agent coordination
     self.instance_id = SHARED.register_instance(self)
 
