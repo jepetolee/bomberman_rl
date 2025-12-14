@@ -530,7 +530,13 @@ def act(self, game_state: dict) -> str:
             teacher_action = None
             try:
                 rule_module = SHARED.ensure_rule_module()
-                helper = self.build_rule_helper(self.logger)
+                # Build a minimal helper; some rule agents expect build_rule_helper attr
+                helper = SimpleNamespace(logger=self.logger)
+                helper.build_rule_helper = lambda *_args, **_kwargs: helper
+                try:
+                    rule_module.setup(helper)
+                except Exception:
+                    pass
                 teacher_action = rule_module.act(helper, game_state)
                 try:
                     with open(log_path, 'a') as f:
