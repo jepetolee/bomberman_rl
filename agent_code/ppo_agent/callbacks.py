@@ -507,6 +507,7 @@ def act(self, game_state: dict) -> str:
         cat = torch.distributions.Categorical(logits=logits)
 
         if self.train:
+            print(f"[PPO Branch] entering train branch", flush=True)
             # 강제 teacher 사용: 무조건 teacher 호출, 반환되면 마스크 무시하고 그대로 적용
             eps = SHARED.current_epsilon()  # 로그용
             round_num = game_state.get('round', 0)
