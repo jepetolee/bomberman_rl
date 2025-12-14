@@ -485,9 +485,21 @@ def act(self, game_state: dict) -> str:
             # Epsilon-greedy on top of stochastic policy to push more exploration
             eps = SHARED.current_epsilon()
             if random.random() < eps:
-                # Uniform over valid actions (logit not -inf)
+                # Try teacher (rule-based) action first
+                teacher_action_idx = None
+                try:
+                    helper = self.build_rule_helper(self.logger)
+                    teacher_action = self.rule_module.act(helper, game_state)
+                    if teacher_action in ACTIONS:
+                        teacher_action_idx = ACTIONS.index(teacher_action)
+                except Exception:
+                    teacher_action_idx = None
+
+                # Valid actions after masking
                 valid_idxs = [i for i, v in enumerate(logits.squeeze(0)) if v > -1e8]
-                if valid_idxs:
+                if teacher_action_idx is not None and teacher_action_idx in valid_idxs:
+                    action_idx = int(teacher_action_idx)
+                elif valid_idxs:
                     action_idx = int(random.choice(valid_idxs))
                 else:
                     action_idx = int(cat.sample().item())
