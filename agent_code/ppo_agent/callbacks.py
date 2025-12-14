@@ -484,6 +484,9 @@ def act(self, game_state: dict) -> str:
         if self.train:
             # Epsilon-greedy on top of stochastic policy to push more exploration
             eps = SHARED.current_epsilon()
+            # Debug: print epsilon at first steps
+            if game_state.get('step', 999) <= 1:
+                print(f"[PPO] Round={game_state.get('round', 0)} Epsilon={eps:.3f} Train={self.train}")
             if random.random() < eps:
                 # Try teacher (rule-based) action first
                 teacher_action_idx = None
@@ -501,12 +504,8 @@ def act(self, game_state: dict) -> str:
                 if teacher_action_idx is not None and teacher_action_idx in valid_idxs:
                     action_idx = int(teacher_action_idx)
                     # Log which teacher action was applied
-                    try:
-                        if self.logger:
-                            self.logger.info(f"[Teacher] module={getattr(self.rule_module, '__name__', 'unknown')} "
-                                             f"action={teacher_action} eps={eps:.3f}")
-                    except Exception:
-                        pass
+                    # Use print for subprocess visibility
+                    print(f"[PPO Agent] Using teacher action={teacher_action} eps={eps:.3f}")
                 elif valid_idxs:
                     action_idx = int(random.choice(valid_idxs))
                 else:
