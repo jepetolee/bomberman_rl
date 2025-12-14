@@ -452,11 +452,11 @@ def _update_env_model():
     
     # Save/load env_model for cross-rank sharing (file-based sync)
     rank, world_size = _get_rank_world_size_from_env()
-        env_model_path = os.path.join(os.path.dirname(SHARED.model_path), 'env_model.pt')
+    env_model_path = os.path.join(os.path.dirname(SHARED.model_path), 'env_model.pt')
     try:
         os.makedirs(os.path.dirname(env_model_path), exist_ok=True)
         if rank == 0:
-        torch.save(SHARED.env_model.state_dict(), env_model_path)
+            torch.save(SHARED.env_model.state_dict(), env_model_path)
             SHARED._env_model_mtime = os.path.getmtime(env_model_path)
         else:
             # For non-zero ranks, reload if a newer file exists
