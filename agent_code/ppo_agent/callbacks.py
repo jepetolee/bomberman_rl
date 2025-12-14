@@ -418,10 +418,18 @@ def setup(self):
 
 
 def act(self, game_state: dict) -> str:
+    import sys
     self.policy.eval()
     
     # Check if new round started (reset z)
     current_round = game_state.get('round', -1)
+    step = game_state.get('step', 999)
+    
+    # Debug: Always print first few steps to verify act() is called
+    if step <= 3:
+        print(f"[ACT CALLED] Round={current_round} Step={step} Train={self.train}", flush=True)
+        sys.stdout.flush()
+    
     if current_round != self._last_round:
         self._current_z = None
         self._last_round = current_round
@@ -485,10 +493,11 @@ def act(self, game_state: dict) -> str:
             # Epsilon-greedy on top of stochastic policy to push more exploration
             eps = SHARED.current_epsilon()
             # Debug: print epsilon at first steps (always print for debugging)
-            step = game_state.get('step', 999)
             round_num = game_state.get('round', 0)
-            if step <= 2:  # Print first 2 steps of each round
-                print(f"[PPO Debug] Round={round_num} Step={step} Epsilon={eps:.3f} Train={self.train} Random={random.random():.3f}")
+            if step <= 3:  # Print first 3 steps of each round
+                rand_val = random.random()
+                print(f"[PPO Debug] Round={round_num} Step={step} Epsilon={eps:.3f} Train={self.train} Random={rand_val:.3f} WillUseTeacher={rand_val < eps}", flush=True)
+                sys.stdout.flush()
             if random.random() < eps:
                 # Try teacher (rule-based) action first
                 teacher_action_idx = None
@@ -498,13 +507,15 @@ def act(self, game_state: dict) -> str:
                     rule_module = SHARED.ensure_rule_module()
                     helper = self.build_rule_helper(self.logger)
                     teacher_action = rule_module.act(helper, game_state)
-                    print(f"[PPO Teacher] Got action: {teacher_action}")  # Debug
+                    print(f"[PPO Teacher] Got action: {teacher_action}", flush=True)  # Debug
+                    sys.stdout.flush()
                     if teacher_action in ACTIONS:
                         teacher_action_idx = ACTIONS.index(teacher_action)
                 except Exception as e:
-                    print(f"[PPO Teacher] Error: {e}")  # Debug error
+                    print(f"[PPO Teacher] Error: {e}", flush=True)  # Debug error
                     import traceback
                     traceback.print_exc()
+                    sys.stdout.flush()
                     teacher_action_idx = None
 
                 # Valid actions after masking
@@ -513,7 +524,8 @@ def act(self, game_state: dict) -> str:
                     action_idx = int(teacher_action_idx)
                     # Log which teacher action was applied
                     # Use print for subprocess visibility
-                    print(f"[PPO Agent] Using teacher action={teacher_action} eps={eps:.3f}")
+                    print(f"[PPO Agent] Using teacher action={teacher_action} eps={eps:.3f}", flush=True)
+                    sys.stdout.flush()
                 elif valid_idxs:
                     action_idx = int(random.choice(valid_idxs))
                 else:
