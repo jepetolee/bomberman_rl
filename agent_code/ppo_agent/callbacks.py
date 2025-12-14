@@ -296,6 +296,8 @@ class _Shared:
             self.suppress_suicide_until = 0
         # Count of finished rounds across all agents (incremented when a round fully wraps up)
         self.completed_rounds = 0
+        # Per-instance round counter for teacher forcing (independent per process)
+        self.instance_round_counts = {}  # instance_id -> round_count
 
         # Suicide penalty schedule: start high, keep high to prevent suicide
         try:
@@ -640,6 +642,10 @@ def setup(self):
 
     # Assign a stable instance id for multi-agent coordination
     self.instance_id = SHARED.register_instance(self)
+    # Initialize instance round counter for teacher forcing
+    if self.instance_id not in SHARED.instance_round_counts:
+        SHARED.instance_round_counts[self.instance_id] = 0
+    self._last_seen_round = -1  # Track last seen round to detect round changes
 
     # Recurrent TRM latent state management
     self._current_z: Optional[torch.Tensor] = None
@@ -736,6 +742,11 @@ def act(self, game_state: dict) -> str:
             # 강제 teacher 사용: 처음 500 라운드는 무조건 teacher, 이후는 epsilon에 따라
             eps = SHARED.current_epsilon()  # 로그용
             round_num = game_state.get('round', 0)
+            
+            # 라운드 변경 감지: 새 라운드가 시작되면 인스턴스별 카운터 증가
+            if round_num != self._last_seen_round and round_num > self._last_seen_round:
+                SHARED.instance_round_counts[self.instance_id] = round_num
+                self._last_seen_round = round_num
             # 확실한 위치에 남긴다: 파일 기준 (agent_code/ppo_agent/act_debug.log)
             log_path = os.path.join(os.path.dirname(__file__), "act_debug.log")
             try:
@@ -752,30 +763,20 @@ def act(self, game_state: dict) -> str:
                 # 콘솔에도 한 줄
                 print(f"[PPO Debug] R={round_num} S={step} eps={eps:.3f} train={self.train}", flush=True)
 
-            # PPO_FORCE_TEACHER_ROUNDS 체크: 처음 500 라운드는 무조건 teacher 사용
+            # PPO_FORCE_TEACHER_ROUNDS 체크: 각 프로세스에서 처음 500 라운드는 무조건 teacher 사용
             force_rounds = int(os.environ.get("PPO_FORCE_TEACHER_ROUNDS", "0"))
             use_teacher = False
             if force_rounds > 0:
-                # global_rounds 확인
-                global_rounds = None
-                results_dir = os.environ.get('A3C_RESULTS_DIR', None)
-                if results_dir:
-                    file_path = os.path.join(results_dir, 'global_round_count.txt')
-                    if os.path.exists(file_path):
-                        try:
-                            with open(file_path, 'r') as f:
-                                global_rounds = int(f.read().strip())
-                        except:
-                            pass
-                if global_rounds is None:
-                    # 파일이 없으면 처음부터 강제 사용
-                    use_teacher = True
-                else:
-                    # 500 라운드 미만이면 강제 사용
-                    use_teacher = (global_rounds < force_rounds)
+                # 각 인스턴스별 라운드 카운트 사용 (프로세스 독립적, round_num 기준)
+                # round_num이 500 미만이면 강제 사용
+                use_teacher = (round_num < force_rounds)
             else:
                 # force_rounds가 0이면 epsilon에 따라 결정
                 use_teacher = (random.random() < eps)
+            
+            # 디버그: use_teacher 결정 로그
+            if step <= 5:
+                print(f"[PPO Teacher Check] force_rounds={force_rounds} round_num={round_num} use_teacher={use_teacher} eps={eps:.3f}", flush=True)
 
             # 하드코딩된 team_teacher_agent 로직 직접 호출 (import 불필요)
             teacher_action_idx = None
@@ -809,34 +810,38 @@ def act(self, game_state: dict) -> str:
             if teacher_action_idx is not None:
                 # teacher가 준 액션이면 마스크 무시하고 그대로 사용
                 action_idx = int(teacher_action_idx)
-                try:
-                    with open(log_path, 'a') as f:
-                        f.write(f"[PPO Agent] Using teacher action={teacher_action} (forced, ignore mask)\n")
-                        f.flush()
-                except Exception:
-                    pass
-                print(f"[PPO Agent] Using teacher action={teacher_action} (forced)", flush=True)
+                if step <= 5:
+                    try:
+                        with open(log_path, 'a') as f:
+                            f.write(f"[PPO Agent] Using teacher action={teacher_action} (forced, ignore mask)\n")
+                            f.flush()
+                    except Exception:
+                        pass
+                    print(f"[PPO Agent] Using teacher action={teacher_action} (forced)", flush=True)
             else:
-                # teacher 실패: 마스크된 유효 액션 중 랜덤 -> 없으면 폴리시 샘플
+                # teacher 실패 또는 use_teacher=False: 마스크된 유효 액션 중 랜덤 -> 없으면 폴리시 샘플
                 valid_idxs = [i for i, v in enumerate(logits.squeeze(0)) if v > -1e8]
                 if valid_idxs:
                     action_idx = int(random.choice(valid_idxs))
-                    try:
-                        with open(log_path, 'a') as f:
-                            f.write("[PPO Agent] Teacher invalid -> random valid action\n")
-                            f.flush()
-                    except Exception:
-                        pass
-                    print("[PPO Agent] Teacher invalid -> random valid action", flush=True)
+                    if step <= 5:
+                        reason = "Teacher not used" if not use_teacher else "Teacher invalid"
+                        try:
+                            with open(log_path, 'a') as f:
+                                f.write(f"[PPO Agent] {reason} -> random valid action\n")
+                                f.flush()
+                        except Exception:
+                            pass
+                        print(f"[PPO Agent] {reason} -> random valid action", flush=True)
                 else:
                     action_idx = int(cat.sample().item())
-                    try:
-                        with open(log_path, 'a') as f:
-                            f.write("[PPO Agent] No valid actions -> policy sample\n")
-                            f.flush()
-                    except Exception:
-                        pass
-                    print("[PPO Agent] No valid actions -> policy sample", flush=True)
+                    if step <= 5:
+                        try:
+                            with open(log_path, 'a') as f:
+                                f.write("[PPO Agent] No valid actions -> policy sample\n")
+                                f.flush()
+                        except Exception:
+                            pass
+                        print("[PPO Agent] No valid actions -> policy sample", flush=True)
         else:
             action_idx = int(torch.argmax(logits, dim=-1).item())
 
