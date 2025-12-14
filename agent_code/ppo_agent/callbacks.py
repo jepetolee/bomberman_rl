@@ -425,10 +425,15 @@ def act(self, game_state: dict) -> str:
     current_round = game_state.get('round', -1)
     step = game_state.get('step', 999)
     
-    # Debug: Always print first few steps to verify act() is called
-    if step <= 3:
-        print(f"[ACT CALLED] Round={current_round} Step={step} Train={self.train}", flush=True)
-        sys.stdout.flush()
+    # Debug: Log to file to avoid subprocess buffering issues
+    try:
+        debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
+        if step <= 3:
+            with open(debug_log, 'a') as f:
+                f.write(f"[ACT CALLED] Round={current_round} Step={step} Train={self.train}\n")
+                f.flush()
+    except Exception:
+        pass
     
     if current_round != self._last_round:
         self._current_z = None
@@ -492,12 +497,17 @@ def act(self, game_state: dict) -> str:
         if self.train:
             # Epsilon-greedy on top of stochastic policy to push more exploration
             eps = SHARED.current_epsilon()
-            # Debug: print epsilon at first steps (always print for debugging)
+            # Debug: Log to file to avoid subprocess buffering issues
             round_num = game_state.get('round', 0)
-            if step <= 3:  # Print first 3 steps of each round
+            if step <= 3:  # Log first 3 steps of each round
                 rand_val = random.random()
-                print(f"[PPO Debug] Round={round_num} Step={step} Epsilon={eps:.3f} Train={self.train} Random={rand_val:.3f} WillUseTeacher={rand_val < eps}", flush=True)
-                sys.stdout.flush()
+                try:
+                    debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
+                    with open(debug_log, 'a') as f:
+                        f.write(f"[PPO Debug] Round={round_num} Step={step} Epsilon={eps:.3f} Train={self.train} Random={rand_val:.3f} WillUseTeacher={rand_val < eps}\n")
+                        f.flush()
+                except Exception:
+                    pass
             if random.random() < eps:
                 # Try teacher (rule-based) action first
                 teacher_action_idx = None
@@ -512,10 +522,16 @@ def act(self, game_state: dict) -> str:
                     if teacher_action in ACTIONS:
                         teacher_action_idx = ACTIONS.index(teacher_action)
                 except Exception as e:
-                    print(f"[PPO Teacher] Error: {e}", flush=True)  # Debug error
-                    import traceback
-                    traceback.print_exc()
-                    sys.stdout.flush()
+                    # Log error to file
+                    try:
+                        debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
+                        with open(debug_log, 'a') as f:
+                            f.write(f"[PPO Teacher] Error: {e}\n")
+                            import traceback
+                            f.write(traceback.format_exc())
+                            f.flush()
+                    except Exception:
+                        pass
                     teacher_action_idx = None
 
                 # Valid actions after masking
@@ -524,8 +540,14 @@ def act(self, game_state: dict) -> str:
                     action_idx = int(teacher_action_idx)
                     # Log which teacher action was applied
                     # Use print for subprocess visibility
-                    print(f"[PPO Agent] Using teacher action={teacher_action} eps={eps:.3f}", flush=True)
-                    sys.stdout.flush()
+                    # Log to file
+                    try:
+                        debug_log = os.path.join(os.path.dirname(SHARED.model_path), 'act_debug.log')
+                        with open(debug_log, 'a') as f:
+                            f.write(f"[PPO Agent] Using teacher action={teacher_action} eps={eps:.3f}\n")
+                            f.flush()
+                    except Exception:
+                        pass
                 elif valid_idxs:
                     action_idx = int(random.choice(valid_idxs))
                 else:
