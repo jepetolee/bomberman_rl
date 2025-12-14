@@ -51,7 +51,7 @@ model:
   # Recursive GTrXL: "One Block, Many Thoughts" (Parameter-Efficient Deep Reasoning)
   recursive_gtrxl:
     # CNN backbone parameters
-    cnn_base_channels: 64  # Base channels for EfficientNet
+    cnn_base_channels: 32  # Base channels for EfficientNet
     cnn_width_mult: 2.0    # Width multiplier (like EfficientNet scaling)
     # Recursive GTrXL parameters
     n_layers_simulated: 4  # Number of recursive passes (K) - 추론 깊이
