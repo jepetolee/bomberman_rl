@@ -316,6 +316,12 @@ class _Shared:
             return float(self.eps_end)
         span = max(1, self.eps_decay_rounds)
         
+        # Force teacher-only phase for early rounds (kick-start)
+        try:
+            force_rounds = int(os.environ.get("PPO_FORCE_TEACHER_ROUNDS", "0"))
+        except Exception:
+            force_rounds = 0
+        
         # ALWAYS use global round count from file - ignore local completed_rounds completely
         # This ensures all workers use the same global total, not individual counts
         global_rounds = None
@@ -356,6 +362,10 @@ class _Shared:
         # MUST use global rounds - if not found, return start epsilon (conservative)
         if global_rounds is None:
             return float(self.eps_start)
+        
+        # Force teacher-only phase for early global rounds
+        if force_rounds > 0 and global_rounds < force_rounds:
+            return 1.0
         
         # Use global round count - this is the TOTAL across all workers
         frac = min(1.0, max(0.0, global_rounds / span))
