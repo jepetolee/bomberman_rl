@@ -166,6 +166,16 @@ def get_distance_to_nearest_enemy(game_state):
     
     return float('inf')
 
+
+def _get_rank_world_size_from_env():
+    """Fetch rank/world_size from env vars set by parent; fallback to single process."""
+    try:
+        rank = int(os.environ.get("A3C_RANK", "0"))
+        world_size = int(os.environ.get("A3C_WORLD_SIZE", "1"))
+    except Exception:
+        rank, world_size = 0, 1
+    return rank, world_size
+
 def setup_training(self):
     # Share hyperparameters and optimizer across agent instances
     SHARED.gamma = 0.99
@@ -436,15 +446,24 @@ def _update_env_model():
     
     SHARED.env_model.eval()  # Switch back to eval for planning
     
-    # Save env_model state so it persists across rounds/subprocesses
-    # This ensures env_model learning accumulates across subprocesses/rounds
+    # Save/load env_model for cross-rank sharing (file-based sync)
+    rank, world_size = _get_rank_world_size_from_env()
+    env_model_path = os.path.join(os.path.dirname(SHARED.model_path), 'env_model.pt')
     try:
-        env_model_path = os.path.join(os.path.dirname(SHARED.model_path), 'env_model.pt')
         os.makedirs(os.path.dirname(env_model_path), exist_ok=True)
-        # Save full env_model state_dict (includes policy_model + next_state_head + reward_head)
-        torch.save(SHARED.env_model.state_dict(), env_model_path)
+        if rank == 0:
+            torch.save(SHARED.env_model.state_dict(), env_model_path)
+            SHARED._env_model_mtime = os.path.getmtime(env_model_path)
+        else:
+            # For non-zero ranks, reload if a newer file exists
+            mtime = os.path.getmtime(env_model_path) if os.path.exists(env_model_path) else 0
+            last = getattr(SHARED, "_env_model_mtime", 0)
+            if mtime > last:
+                state = torch.load(env_model_path, map_location=SHARED.device, weights_only=True)
+                SHARED.env_model.load_state_dict(state, strict=False)
+                SHARED._env_model_mtime = mtime
     except Exception:
-        # Silently ignore save errors (don't break training)
+        # Silently ignore save/load errors (don't break training)
         pass
 
 

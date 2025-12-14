@@ -51,13 +51,13 @@ model:
   # Recursive GTrXL: "One Block, Many Thoughts" (Parameter-Efficient Deep Reasoning)
   recursive_gtrxl:
     # CNN backbone parameters
-    cnn_base_channels: 32  # Base channels for EfficientNet
+    cnn_base_channels: 64  # Base channels for EfficientNet
     cnn_width_mult: 1.0    # Width multiplier (like EfficientNet scaling)
     # Recursive GTrXL parameters
     n_layers_simulated: 4  # Number of recursive passes (K) - 추론 깊이
                             # 4~8 권장, 작게 시작할 때는 4로 시작
     num_heads: 8           # Number of attention heads
-    memory_size: 128       # Memory length for Transformer-XL
+    memory_size: 256       # Memory length for Transformer-XL
                             # 각 재귀 단계마다 별도 메모리 슬롯 사용
 
 
@@ -87,7 +87,7 @@ phase2:
   # Environment Model Training
   env_model:
     enabled: true
-    num_epochs: 50
+    num_epochs: 30
     batch_size: 128
     learning_rate: 0.001
     model_path: "data/env_models/env_model.pt"
@@ -108,7 +108,7 @@ phase2:
     enabled: true
     num_epochs: 50        # More epochs for large model
     batch_size: 512        # Increased batch size (RTX 4090 has plenty of VRAM)
-    learning_rate: 1e-4    # Lower LR for very large model (256-dim)
+    learning_rate: 1e-5    # Lower LR for very large model (256-dim)
     
     # Strategy: "last" (paper), "all" (average), "weighted" (weighted average)
     strategy: "all"

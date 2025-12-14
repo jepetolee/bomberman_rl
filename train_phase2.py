@@ -55,13 +55,23 @@ class TeacherDataset(Dataset):
         return episode
 
 
-def load_all_episodes(data_dir: str, max_episodes: int = None) -> List[Dict]:
+def load_all_episodes(data_dir: str, max_episodes: int = None, wins_only: bool = False) -> List[Dict]:
     """Load all episodes into memory"""
     dataset = TeacherDataset(data_dir, max_episodes)
     episodes = []
     
+    skipped = 0
     for i in range(len(dataset)):
-        episodes.append(dataset[i])
+        ep = dataset[i]
+        if wins_only:
+            # Use sum of returns (GAE) as win proxy; requires positive total return
+            if ep.get("rewards") is None or ep["rewards"].sum() <= 0:
+                skipped += 1
+                continue
+        episodes.append(ep)
+    
+    if wins_only:
+        print(f"[Filter] wins_only=True → kept {len(episodes)} episodes, skipped {skipped}")
     
     return episodes
 
@@ -118,6 +128,7 @@ def train_policy_with_planning(
     sim_weight: float = 0.5,
     config_path: str = "config/trm_config.yaml",
     device: torch.device = None,
+    wins_only: bool = False,
 ):
     """Train policy with Dyna-Q planning + DeepSupervision"""
     if device is None:
@@ -130,7 +141,7 @@ def train_policy_with_planning(
     config = load_config_func(config_path)
     
     # Load episodes
-    episodes = load_all_episodes(data_dir)
+    episodes = load_all_episodes(data_dir, wins_only=wins_only)
     if len(episodes) == 0:
         raise ValueError(f"No episodes found in {data_dir}")
     
@@ -372,6 +383,7 @@ def main():
     parser.add_argument('--planning-steps', type=int, default=None, help='Number of planning steps per epoch (overrides config)')
     parser.add_argument('--lr', type=float, default=None, help='Learning rate (overrides config)')
     parser.add_argument('--train-value', action='store_true', default=None, help='Train value network with rewards (overrides config)')
+    parser.add_argument('--wins-only', action='store_true', help='Use only winning episodes (sum rewards > 0)')
     
     args = parser.parse_args()
     
@@ -425,6 +437,7 @@ def main():
             real_weight=real_weight,
             sim_weight=sim_weight,
             config_path=args.config,  # Pass config path
+            wins_only=args.wins_only,
         )
 
 

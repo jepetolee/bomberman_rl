@@ -485,6 +485,10 @@ def worker_loop(
         worker_env['PPO_MODEL_PATH'] = global_model_path  # Use global model path for initial load
         worker_env['A3C_RESULTS_DIR'] = results_dir  # Pass results_dir so PPO can save stats here
         worker_env['A3C_NUM_WORKERS'] = str(num_workers)  # Also pass worker count for epsilon
+        # Pass dist rank/world_size to child so env_model sync can be coordinated by files
+        if dist.is_available() and dist.is_initialized():
+            worker_env['A3C_RANK'] = str(rank)
+            worker_env['A3C_WORLD_SIZE'] = str(world_size)
         
         output_file = os.path.join(
             results_dir,
