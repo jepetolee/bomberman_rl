@@ -1,6 +1,7 @@
 import importlib
 import os
 import random
+from collections import deque
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
@@ -20,6 +21,231 @@ def _team_tag(agent_name: str) -> str:
         return ""
     name = str(agent_name)
     return name.split('_')[0]
+
+
+def _agent_suffix(name: str) -> int:
+    try:
+        return int(str(name).split('_', 1)[1])
+    except Exception:
+        return 0
+
+
+def _look_for_targets(free_space, start, targets, logger=None):
+    """Team teacher agent's pathfinding logic."""
+    if len(targets) == 0:
+        return None
+    frontier = [start]
+    parent_dict = {start: start}
+    dist_so_far = {start: 0}
+    best = start
+    best_dist = np.sum(np.abs(np.subtract(targets, start)), axis=1).min()
+    while len(frontier) > 0:
+        current = frontier.pop(0)
+        d = np.sum(np.abs(np.subtract(targets, current)), axis=1).min()
+        if d + dist_so_far[current] <= best_dist:
+            best = current
+            best_dist = d + dist_so_far[current]
+        if d == 0:
+            best = current
+            break
+        x, y = current
+        neighbors = [(x, y) for (x, y) in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] if free_space[x, y]]
+        random.shuffle(neighbors)
+        for neighbor in neighbors:
+            if neighbor not in parent_dict:
+                frontier.append(neighbor)
+                parent_dict[neighbor] = current
+                dist_so_far[neighbor] = dist_so_far[current] + 1
+    current = best
+    while True:
+        if parent_dict[current] == start:
+            return current
+        current = parent_dict[current]
+
+
+def _teammate_positions(self_tag: str, others: List[Tuple]) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    teammates = []
+    enemies = []
+    for other in others:
+        name, _score, _bombs_left, pos = other
+        if _team_tag(name) == self_tag:
+            teammates.append(pos)
+        else:
+            enemies.append(pos)
+    return teammates, enemies
+
+
+def _coin_partition(coins: List[Tuple[int, int]], teammates: List[Tuple[int, int]], self_pos: Tuple[int, int]):
+    if not coins or not teammates:
+        return coins
+    sx, sy = self_pos
+    keep = []
+    for cx, cy in coins:
+        self_dist = abs(cx - sx) + abs(cy - sy)
+        teammate_best = min(abs(cx - tx) + abs(cy - ty) for tx, ty in teammates)
+        if self_dist <= teammate_best:
+            keep.append((cx, cy))
+    return keep if keep else coins
+
+
+def _teammate_in_blast(center: Tuple[int, int], teammates: List[Tuple[int, int]], radius: int = s.BOMB_POWER) -> bool:
+    if not teammates:
+        return False
+    cx, cy = center
+    for tx, ty in teammates:
+        if tx == cx and abs(ty - cy) <= radius:
+            return True
+        if ty == cy and abs(tx - cx) <= radius:
+            return True
+    return False
+
+
+def _team_teacher_act(game_state: dict, instance_id: int) -> str:
+    """Hardcoded team_teacher_agent act logic - no imports needed."""
+    # Get or init state per instance
+    if not hasattr(SHARED, '_teacher_state'):
+        SHARED._teacher_state = {}
+    state = SHARED._teacher_state.setdefault(instance_id, {
+        'bomb_history': deque([], 5),
+        'coordinate_history': deque([], 20),
+        'ignore_others_timer': 0,
+        'current_round': -1
+    })
+    
+    if game_state["round"] != state['current_round']:
+        state['bomb_history'].clear()
+        state['coordinate_history'].clear()
+        state['ignore_others_timer'] = 0
+        state['current_round'] = game_state["round"]
+    
+    arena = game_state['field']
+    self_name, score, bombs_left, (x, y) = game_state['self']
+    bombs = game_state['bombs']
+    bomb_xys = [xy for (xy, _timer) in bombs]
+    others = game_state['others']
+    coins = game_state['coins']
+    
+    self_tag = _team_tag(self_name)
+    teammates, enemies = _teammate_positions(self_tag, others)
+    
+    role = _agent_suffix(self_name)
+    is_support = role % 2 == 1
+    
+    bomb_map = np.ones(arena.shape) * 5
+    for (xb, yb), t in bombs:
+        for (i, j) in [(xb + h, yb) for h in range(-3, 4)] + [(xb, yb + h) for h in range(-3, 4)]:
+            if (0 < i < bomb_map.shape[0]) and (0 < j < bomb_map.shape[1]):
+                bomb_map[i, j] = min(bomb_map[i, j], t)
+    
+    if state['coordinate_history'].count((x, y)) > 2:
+        state['ignore_others_timer'] = 5
+    else:
+        state['ignore_others_timer'] = max(0, state['ignore_others_timer'] - 1)
+    state['coordinate_history'].append((x, y))
+    
+    directions = [(x, y), (x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+    valid_tiles, valid_actions = [], []
+    occupied = [pos for _n, _s, _b, pos in others]
+    for d in directions:
+        if ((arena[d] == 0) and
+                (game_state['explosion_map'][d] < 1) and
+                (bomb_map[d] > 0) and
+                (d not in occupied) and
+                (d not in bomb_xys)):
+            valid_tiles.append(d)
+    if (x - 1, y) in valid_tiles:
+        valid_actions.append('LEFT')
+    if (x + 1, y) in valid_tiles:
+        valid_actions.append('RIGHT')
+    if (x, y - 1) in valid_tiles:
+        valid_actions.append('UP')
+    if (x, y + 1) in valid_tiles:
+        valid_actions.append('DOWN')
+    if (x, y) in valid_tiles:
+        valid_actions.append('WAIT')
+    if (bombs_left > 0) and (x, y) not in state['bomb_history']:
+        valid_actions.append('BOMB')
+    
+    action_ideas = ['UP', 'DOWN', 'LEFT', 'RIGHT']
+    random.shuffle(action_ideas)
+    
+    cols = range(1, arena.shape[0] - 1)
+    rows = range(1, arena.shape[1] - 1)
+    dead_ends = [(ix, iy) for ix in cols for iy in rows if (arena[ix, iy] == 0) and
+                 ([arena[ix + 1, iy], arena[ix - 1, iy], arena[ix, iy + 1], arena[ix, iy - 1]].count(0) == 1)]
+    crates = [(ix, iy) for ix in cols for iy in rows if (arena[ix, iy] == 1)]
+    
+    teammate_positions = teammates
+    filtered_coins = _coin_partition(coins, teammate_positions, (x, y))
+    
+    targets: List[Tuple[int, int]] = []
+    targets.extend(filtered_coins)
+    targets.extend(dead_ends)
+    targets.extend(crates)
+    
+    if not is_support or len(filtered_coins) + len(crates) == 0:
+        targets.extend([pos for pos in enemies])
+    
+    targets = [t for t in targets if t not in bomb_xys]
+    
+    free_space = arena == 0
+    if state['ignore_others_timer'] > 0:
+        for pos in occupied:
+            free_space[pos] = False
+    d = _look_for_targets(free_space, (x, y), targets, None)
+    if d == (x, y - 1):
+        action_ideas.append('UP')
+    if d == (x, y + 1):
+        action_ideas.append('DOWN')
+    if d == (x - 1, y):
+        action_ideas.append('LEFT')
+    if d == (x + 1, y):
+        action_ideas.append('RIGHT')
+    if d is None:
+        action_ideas.append('WAIT')
+    
+    if (x, y) in dead_ends:
+        action_ideas.append('BOMB')
+    if enemies:
+        if min(abs(ex - x) + abs(ey - y) for ex, ey in enemies) <= 1:
+            action_ideas.append('BOMB')
+    if d == (x, y) and ([arena[x + 1, y], arena[x - 1, y], arena[x, y + 1], arena[x, y - 1]].count(1) > 0):
+        action_ideas.append('BOMB')
+    
+    for (xb, yb), t in bombs:
+        if (xb == x) and (abs(yb - y) < 4):
+            if (yb > y):
+                action_ideas.append('UP')
+            if (yb < y):
+                action_ideas.append('DOWN')
+            action_ideas.append('LEFT')
+            action_ideas.append('RIGHT')
+        if (yb == y) and (abs(xb - x) < 4):
+            if (xb > x):
+                action_ideas.append('LEFT')
+            if (xb < x):
+                action_ideas.append('RIGHT')
+            action_ideas.append('UP')
+            action_ideas.append('DOWN')
+    for (xb, yb), t in bombs:
+        if xb == x and yb == y:
+            action_ideas.extend(action_ideas[:4])
+    
+    def bomb_safe_for_team() -> bool:
+        if not enemies:
+            return False
+        return not _teammate_in_blast((x, y), teammate_positions)
+    
+    while len(action_ideas) > 0:
+        a = action_ideas.pop()
+        if a == 'BOMB' and not bomb_safe_for_team():
+            continue
+        if a in valid_actions:
+            if a == 'BOMB':
+                state['bomb_history'].append((x, y))
+            return a
+    
+    return 'WAIT'
 
 
 def _to_device() -> torch.device:
@@ -527,42 +753,32 @@ def act(self, game_state: dict) -> str:
                 # 콘솔에도 한 줄
                 print(f"[PPO Debug] R={round_num} S={step} eps={eps:.3f} train={self.train}", flush=True)
 
+            # 하드코딩된 team_teacher_agent 로직 직접 호출 (import 불필요)
             teacher_action_idx = None
             teacher_action = None
             try:
-                rule_module = SHARED.ensure_rule_module()
-                # Build helper with dummy logger and build_rule_helper attr for compatibility
-                class _DummyLogger:
-                    def debug(self,*a,**k): pass
-                    def info(self,*a,**k): pass
-                    def warning(self,*a,**k): pass
-                    def error(self,*a,**k): pass
-                helper = SimpleNamespace(logger=self.logger or _DummyLogger())
-                helper.build_rule_helper = lambda *_args, **_kwargs: helper
-                try:
-                    rule_module.setup(helper)
-                except Exception:
-                    pass
-                teacher_action = rule_module.act(helper, game_state)
-                try:
-                    with open(log_path, 'a') as f:
-                        f.write(f"[PPO Teacher] Got action: {teacher_action}\n")
-                        f.flush()
-                except Exception:
-                    pass
-                print(f"[PPO Teacher] Got action: {teacher_action}", flush=True)
+                teacher_action = _team_teacher_act(game_state, self.instance_id)
+                if step <= 5:
+                    try:
+                        with open(log_path, 'a') as f:
+                            f.write(f"[PPO Teacher] Got action: {teacher_action}\n")
+                            f.flush()
+                    except Exception:
+                        pass
+                    print(f"[PPO Teacher] Got action: {teacher_action}", flush=True)
                 if teacher_action in ACTIONS:
                     teacher_action_idx = ACTIONS.index(teacher_action)
             except Exception as e:
                 import traceback
                 err_txt = f"[PPO Teacher] Error: {e}\n{traceback.format_exc()}"
-                try:
-                    with open(log_path, 'a') as f:
-                        f.write(err_txt + "\n")
-                        f.flush()
-                except Exception:
-                    pass
-                print(err_txt, flush=True)
+                if step <= 5:
+                    try:
+                        with open(log_path, 'a') as f:
+                            f.write(err_txt + "\n")
+                            f.flush()
+                    except Exception:
+                        pass
+                    print(err_txt, flush=True)
                 teacher_action_idx = None
 
             if teacher_action_idx is not None:
