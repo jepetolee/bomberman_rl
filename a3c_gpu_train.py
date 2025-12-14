@@ -43,6 +43,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process, Queue, Value, Lock
 
@@ -279,6 +280,30 @@ def create_model(model_path: str, device: torch.device):
 
     model = model.to(device)
     return model
+
+
+def try_init_distributed():
+    """Initialize torch.distributed if launched under torchrun."""
+    if dist.is_available() and not dist.is_initialized():
+        required_env = ["RANK", "WORLD_SIZE", "LOCAL_RANK"]
+        if all(k in os.environ for k in required_env):
+            dist.init_process_group(backend="nccl", init_method="env://")
+    return dist.is_initialized()
+
+
+def dist_allreduce_model(model: nn.Module):
+    """All-reduce model parameters and buffers, then average."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    world_size = dist.get_world_size()
+    if world_size <= 1:
+        return
+    for p in model.parameters():
+        dist.all_reduce(p.data, op=dist.ReduceOp.SUM)
+        p.data /= world_size
+    for b in model.buffers():
+        dist.all_reduce(b.data, op=dist.ReduceOp.SUM)
+        b.data /= world_size
 
 
 def average_model_weights(weight_dicts: List[Dict], global_weights: Optional[Dict] = None, 
@@ -729,53 +754,66 @@ def worker_loop(
 
 def run_adaptive_training(config: Dict):
     """Main training with weight averaging."""
-    print("="*70)
-    print("A3C GPU: Weight Averaging (Federated Learning Style)")
-    print("="*70)
-    print()
+    is_dist = try_init_distributed()
+    rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+    world_size = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+    local_rank = int(os.environ.get("LOCAL_RANK", 0)) if is_dist else 0
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    if device.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print()
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
     
-    print("Architecture:")
-    print("  ┌─────────────────────────────────────────────────────┐")
-    print("  │  Each Worker: Independent Local Model              │")
-    print("  │  - Collects experiences                            │")
-    print("  │  - Updates locally via PPO                         │")
-    print("  │  - Sends weights periodically                      │")
-    print("  │                                                     │")
-    print("  │  Main Process: Weight Averaging                    │")
-    print("  │  - Collects weights from all workers              │")
-    print("  │  - Averages weights → Global Model                 │")
-    print("  │  - Distributes to workers                          │")
-    print("  └─────────────────────────────────────────────────────┘")
-    print()
-    
-    print("Curriculum Stages (advance when Team A win rate exceeds threshold):")
-    for i, (name, opponents, threshold) in enumerate(CURRICULUM_STAGES):
-        print(f"  {i+1}. {name}: Team A vs {opponents} → {threshold:.0%}")
-    print(f"  5. {SELF_PLAY_STAGE}")
-    print()
-    
-    print(f"Configuration:")
-    print(f"  Workers: {config['num_workers']}")
-    print(f"  Max Rounds: {config['total_rounds']}")
-    print(f"  Sync Interval: {config['sync_interval']} batches")
-    print(f"  Eval Window: {config['eval_window']} rounds")
-    print()
+    if rank == 0:
+        print("="*70)
+        print("A3C GPU: Weight Averaging (Federated Learning Style)")
+        print("="*70)
+        print()
+        print(f"Device: {device}")
+        if device.type == 'cuda':
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print()
+        
+        print("Architecture:")
+        print("  ┌─────────────────────────────────────────────────────┐")
+        print("  │  Each Worker: Independent Local Model              │")
+        print("  │  - Collects experiences                            │")
+        print("  │  - Updates locally via PPO                         │")
+        print("  │  - Sends weights periodically                      │")
+        print("  │                                                     │")
+        print("  │  Main Process: Weight Averaging                    │")
+        print("  │  - Collects weights from all workers              │")
+        print("  │  - Averages weights → Global Model                 │")
+        print("  │  - Distributes to workers                          │")
+        print("  └─────────────────────────────────────────────────────┘")
+        print()
+        
+        print("Curriculum Stages (advance when Team A win rate exceeds threshold):")
+        for i, (name, opponents, threshold) in enumerate(CURRICULUM_STAGES):
+            print(f"  {i+1}. {name}: Team A vs {opponents} → {threshold:.0%}")
+        print(f"  5. {SELF_PLAY_STAGE}")
+        print()
+        
+        print(f"Configuration:")
+        print(f"  Workers: {config['num_workers']} (world_size={world_size})")
+        print(f"  Max Rounds: {config['total_rounds']}")
+        print(f"  Sync Interval: {config['sync_interval']} batches")
+        print(f"  Eval Window: {config['eval_window']} rounds")
+        print()
     
     # Create directories - ensure absolute path
     config['results_dir'] = os.path.abspath(config['results_dir'])
+    if is_dist:
+        # Avoid file collisions across ranks
+        config['results_dir'] = os.path.join(config['results_dir'], f"rank{rank}")
     os.makedirs(config['results_dir'], exist_ok=True)
     
     # Create global model
-    print("Creating global model...")
+    if rank == 0:
+        print("Creating global model...")
     global_model = create_model(config['model_path'], device)
-    print(f"  Parameters: {sum(p.numel() for p in global_model.parameters()):,}")
-    print()
+    if rank == 0:
+        print(f"  Parameters: {sum(p.numel() for p in global_model.parameters()):,}")
+        print()
     
     # Trackers
     curriculum = AdaptiveCurriculum(eval_window=config['eval_window'])
@@ -793,7 +831,8 @@ def run_adaptive_training(config: Dict):
     
     # Start workers
     workers = []
-    print(f"Starting {config['num_workers']} workers...")
+    if rank == 0:
+        print(f"Starting {config['num_workers']} workers...")
     
     start_time = time.time()
     
@@ -899,11 +938,15 @@ def run_adaptive_training(config: Dict):
                 
                 # Update global model
                 global_model.load_state_dict(avg_weights)
-                torch.save(global_model.state_dict(), config['model_path'])
                 
-                print(f"[Sync {sync_count}] ★ Averaged {len(weight_list)}/{config['num_workers']} workers "
-                      f"+ {global_weight_ratio:.0%} global model")
-                print(f"    Global model updated and saved!")
+                # Distributed all-reduce to average across torchrun ranks (method B)
+                dist_allreduce_model(global_model)
+                
+                if rank == 0:
+                    torch.save(global_model.state_dict(), config['model_path'])
+                    print(f"[Sync {sync_count}] ★ Averaged {len(weight_list)}/{config['num_workers']} workers "
+                          f"+ {global_weight_ratio:.0%} global model (dist world_size={world_size})")
+                    print(f"    Global model updated and saved!")
                 
                 # Clear collected weights after processing
                 pending_weights.clear()
@@ -1034,9 +1077,10 @@ def run_adaptive_training(config: Dict):
         'best_performance': perf_tracker.best_score,
     }
     
-    results_file = os.path.join(config['results_dir'], 'training_results.json')
-    with open(results_file, 'w') as f:
-        json.dump(results, f, indent=2)
+    if rank == 0:
+        results_file = os.path.join(config['results_dir'], 'training_results.json')
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=2)
     
     return results
 
