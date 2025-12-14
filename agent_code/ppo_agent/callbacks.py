@@ -474,7 +474,7 @@ def act(self, game_state: dict) -> str:
                 logits, value, _ = self.policy.forward_with_z(x, z_prev=None)
                 self._last_z_prev = None
         else:
-            logits, value = self.policy(x)
+            logits, value = self.policy(x)  
             self._last_z_prev = None
         
         # Mask unsafe actions (tiles about to explode)
@@ -484,19 +484,27 @@ def act(self, game_state: dict) -> str:
         if self.train:
             # Epsilon-greedy on top of stochastic policy to push more exploration
             eps = SHARED.current_epsilon()
-            # Debug: print epsilon at first steps
-            if game_state.get('step', 999) <= 1:
-                print(f"[PPO] Round={game_state.get('round', 0)} Epsilon={eps:.3f} Train={self.train}")
+            # Debug: print epsilon at first steps (always print for debugging)
+            step = game_state.get('step', 999)
+            round_num = game_state.get('round', 0)
+            if step <= 2:  # Print first 2 steps of each round
+                print(f"[PPO Debug] Round={round_num} Step={step} Epsilon={eps:.3f} Train={self.train} Random={random.random():.3f}")
             if random.random() < eps:
                 # Try teacher (rule-based) action first
                 teacher_action_idx = None
                 teacher_action = None
                 try:
+                    # Ensure rule module is loaded via SHARED
+                    rule_module = SHARED.ensure_rule_module()
                     helper = self.build_rule_helper(self.logger)
-                    teacher_action = self.rule_module.act(helper, game_state)
+                    teacher_action = rule_module.act(helper, game_state)
+                    print(f"[PPO Teacher] Got action: {teacher_action}")  # Debug
                     if teacher_action in ACTIONS:
                         teacher_action_idx = ACTIONS.index(teacher_action)
-                except Exception:
+                except Exception as e:
+                    print(f"[PPO Teacher] Error: {e}")  # Debug error
+                    import traceback
+                    traceback.print_exc()
                     teacher_action_idx = None
 
                 # Valid actions after masking
