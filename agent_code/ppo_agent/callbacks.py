@@ -487,6 +487,7 @@ def act(self, game_state: dict) -> str:
             if random.random() < eps:
                 # Try teacher (rule-based) action first
                 teacher_action_idx = None
+                teacher_action = None
                 try:
                     helper = self.build_rule_helper(self.logger)
                     teacher_action = self.rule_module.act(helper, game_state)
@@ -499,6 +500,13 @@ def act(self, game_state: dict) -> str:
                 valid_idxs = [i for i, v in enumerate(logits.squeeze(0)) if v > -1e8]
                 if teacher_action_idx is not None and teacher_action_idx in valid_idxs:
                     action_idx = int(teacher_action_idx)
+                    # Log which teacher action was applied
+                    try:
+                        if self.logger:
+                            self.logger.info(f"[Teacher] module={getattr(self.rule_module, '__name__', 'unknown')} "
+                                             f"action={teacher_action} eps={eps:.3f}")
+                    except Exception:
+                        pass
                 elif valid_idxs:
                     action_idx = int(random.choice(valid_idxs))
                 else:
