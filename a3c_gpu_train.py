@@ -421,6 +421,18 @@ def worker_loop(
     os.environ['SDL_AUDIODRIVER'] = 'dummy'
     os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
     
+    # Apply YAML config to environment variables in worker process
+    # This ensures teacher/epsilon settings from YAML are available
+    try:
+        from config.load_config import load_config, apply_config_to_env
+        cfg_path = os.environ.get("BOMBER_CONFIG_PATH", "config/trm_config.yaml")
+        if os.path.exists(cfg_path):
+            cfg = load_config(cfg_path)
+            apply_config_to_env(cfg)
+            print(f"[Worker {worker_id}] Applied YAML config from {cfg_path}")
+    except Exception as e:
+        print(f"[Worker {worker_id}] Warning: Failed to apply YAML config: {e}")
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[Worker {worker_id}] Started")
     
