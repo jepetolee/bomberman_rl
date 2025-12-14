@@ -733,8 +733,7 @@ def act(self, game_state: dict) -> str:
         cat = torch.distributions.Categorical(logits=logits)
 
         if self.train:
-            print(f"[PPO Branch] entering train branch", flush=True)
-            # 강제 teacher 사용: 무조건 teacher 호출, 반환되면 마스크 무시하고 그대로 적용
+            # 강제 teacher 사용: 처음 500 라운드는 무조건 teacher, 이후는 epsilon에 따라
             eps = SHARED.current_epsilon()  # 로그용
             round_num = game_state.get('round', 0)
             # 확실한 위치에 남긴다: 파일 기준 (agent_code/ppo_agent/act_debug.log)
@@ -753,33 +752,59 @@ def act(self, game_state: dict) -> str:
                 # 콘솔에도 한 줄
                 print(f"[PPO Debug] R={round_num} S={step} eps={eps:.3f} train={self.train}", flush=True)
 
+            # PPO_FORCE_TEACHER_ROUNDS 체크: 처음 500 라운드는 무조건 teacher 사용
+            force_rounds = int(os.environ.get("PPO_FORCE_TEACHER_ROUNDS", "0"))
+            use_teacher = False
+            if force_rounds > 0:
+                # global_rounds 확인
+                global_rounds = None
+                results_dir = os.environ.get('A3C_RESULTS_DIR', None)
+                if results_dir:
+                    file_path = os.path.join(results_dir, 'global_round_count.txt')
+                    if os.path.exists(file_path):
+                        try:
+                            with open(file_path, 'r') as f:
+                                global_rounds = int(f.read().strip())
+                        except:
+                            pass
+                if global_rounds is None:
+                    # 파일이 없으면 처음부터 강제 사용
+                    use_teacher = True
+                else:
+                    # 500 라운드 미만이면 강제 사용
+                    use_teacher = (global_rounds < force_rounds)
+            else:
+                # force_rounds가 0이면 epsilon에 따라 결정
+                use_teacher = (random.random() < eps)
+
             # 하드코딩된 team_teacher_agent 로직 직접 호출 (import 불필요)
             teacher_action_idx = None
             teacher_action = None
-            try:
-                teacher_action = _team_teacher_act(game_state, self.instance_id)
-                if step <= 5:
-                    try:
-                        with open(log_path, 'a') as f:
-                            f.write(f"[PPO Teacher] Got action: {teacher_action}\n")
-                            f.flush()
-                    except Exception:
-                        pass
-                    print(f"[PPO Teacher] Got action: {teacher_action}", flush=True)
-                if teacher_action in ACTIONS:
-                    teacher_action_idx = ACTIONS.index(teacher_action)
-            except Exception as e:
-                import traceback
-                err_txt = f"[PPO Teacher] Error: {e}\n{traceback.format_exc()}"
-                if step <= 5:
-                    try:
-                        with open(log_path, 'a') as f:
-                            f.write(err_txt + "\n")
-                            f.flush()
-                    except Exception:
-                        pass
-                    print(err_txt, flush=True)
-                teacher_action_idx = None
+            if use_teacher:
+                try:
+                    teacher_action = _team_teacher_act(game_state, self.instance_id)
+                    if step <= 5:
+                        try:
+                            with open(log_path, 'a') as f:
+                                f.write(f"[PPO Teacher] Got action: {teacher_action}\n")
+                                f.flush()
+                        except Exception:
+                            pass
+                        print(f"[PPO Teacher] Got action: {teacher_action}", flush=True)
+                    if teacher_action in ACTIONS:
+                        teacher_action_idx = ACTIONS.index(teacher_action)
+                except Exception as e:
+                    import traceback
+                    err_txt = f"[PPO Teacher] Error: {e}\n{traceback.format_exc()}"
+                    if step <= 5:
+                        try:
+                            with open(log_path, 'a') as f:
+                                f.write(err_txt + "\n")
+                                f.flush()
+                        except Exception:
+                            pass
+                        print(err_txt, flush=True)
+                    teacher_action_idx = None
 
             if teacher_action_idx is not None:
                 # teacher가 준 액션이면 마스크 무시하고 그대로 사용
