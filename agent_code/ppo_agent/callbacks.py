@@ -360,7 +360,10 @@ class _Shared:
                 pass
         
         # MUST use global rounds - if not found, return start epsilon (conservative)
+        # 하지만 force_rounds가 설정되어 있으면 라운드 파일이 없어도 teacher만 사용
         if global_rounds is None:
+            if force_rounds > 0:
+                return 1.0
             return float(self.eps_start)
         
         # Force teacher-only phase for early global rounds
