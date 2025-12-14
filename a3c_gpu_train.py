@@ -58,12 +58,16 @@ TEAM_PLAY_AGENTS = {
     'team_teacher_agent',
 }
 
+# Max rounds allowed per stage before forcing advancement (env override)
+MAX_STAGE_ROUNDS = int(os.environ.get("CURRICULUM_MAX_STAGE_ROUNDS", "100"))
+
 CURRICULUM_STAGES = [
     # (stage_name, opponent_pool, win_rate_threshold_to_advance)
-    ("Stage 1: Easy", ['random_agent', 'peaceful_agent'], 0.60),
-    ("Stage 2: Medium", ['peaceful_agent', 'coin_collector_agent'], 0.65),
-    ("Stage 3: Hard", ['coin_collector_agent', 'rule_based_agent'], 0.70),
-    ("Stage 4: Expert", ['team_teacher_agent', 'aggressive_teacher_agent'], 0.75),
+    # Lower thresholds to advance faster
+    ("Stage 1: Easy", ['random_agent', 'peaceful_agent'], 0.10),
+    ("Stage 2: Medium", ['peaceful_agent', 'coin_collector_agent'], 0.30),
+    ("Stage 3: Hard", ['coin_collector_agent', 'rule_based_agent'], 0.30),
+    ("Stage 4: Expert", ['team_teacher_agent', 'aggressive_teacher_agent'], 0.30),
     # Stage 5 is self-play - handled separately
 ]
 
@@ -111,6 +115,10 @@ class AdaptiveCurriculum:
         """Check if we should advance to next stage."""
         if self.current_stage >= self.total_stages:
             return False  # Already in self-play
+
+        # Force advance if too many rounds spent in this stage
+        if self.stage_rounds >= MAX_STAGE_ROUNDS:
+            return True
         
         if len(self.recent_results) < self.eval_window // 2:
             return False  # Not enough data
