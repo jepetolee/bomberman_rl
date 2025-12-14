@@ -587,7 +587,6 @@ def act(self, game_state: dict) -> str:
                         pass
                     print("[PPO Agent] Teacher invalid -> random valid action", flush=True)
                 else:
-            action_idx = int(cat.sample().item())
                     try:
                         with open(log_path, 'a') as f:
                             f.write("[PPO Agent] No valid actions -> policy sample\n")
@@ -595,6 +594,8 @@ def act(self, game_state: dict) -> str:
                     except Exception:
                         pass
                     print("[PPO Agent] No valid actions -> policy sample", flush=True)
+                else:
+                    action_idx = int(cat.sample().item())
         else:
             action_idx = int(torch.argmax(logits, dim=-1).item())
 
