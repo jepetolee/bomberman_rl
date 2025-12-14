@@ -691,5 +691,3 @@ def state_to_features(game_state: dict) -> np.ndarray:
     grid[9] = danger_map
 
     return grid.astype(np.float32)
-
-
