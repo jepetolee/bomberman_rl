@@ -59,7 +59,7 @@ class _Shared:
         except Exception:
             self.eps_end = 0.2  # Default: keep 20% teacher guidance even at end
         try:
-            self.eps_decay_rounds = int(os.environ.get("PPO_EPS_DECAY_ROUNDS", "400000"))
+            self.eps_decay_rounds = int(os.environ.get("PPO_EPS_DECAY_ROUNDS", "10000"))
         except Exception:
             self.eps_decay_rounds = 1500
 
