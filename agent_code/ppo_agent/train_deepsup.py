@@ -16,6 +16,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 
 from .models.vit_trm import PolicyValueViT_TRM, PolicyValueViT_TRM_Hybrid
+from .models.vit import PolicyValueViT
 
 
 def train_policy_deepsup(
@@ -53,12 +54,20 @@ def train_policy_deepsup(
     
     model.train()
     
-    # Check if model is hybrid or original TRM
+    # Check if model is ViT Only, EfficientGTrXL, hybrid, or original TRM
     model_class_name = model.__class__.__name__
+    is_vit_only = (model_class_name == 'PolicyValueViT')
+    is_efficient_gtrxl = (model_class_name == 'PolicyValueEfficientGTrXL')
     is_hybrid = (model_class_name == 'PolicyValueViT_TRM_Hybrid')
     
     # Enable/disable gradient for value head based on train_value flag
-    if is_hybrid:
+    if is_vit_only or is_efficient_gtrxl:
+        # ViT Only or EfficientGTrXL model: standard setup
+        for param in model.v_head.parameters():
+            param.requires_grad = train_value and (rewards is not None)
+        for param in model.pi_head.parameters():
+            param.requires_grad = True
+    elif is_hybrid:
         # Hybrid model: ViT has its own heads
         for param in model.vit.v_head.parameters():
             param.requires_grad = train_value and (rewards is not None)
@@ -97,10 +106,35 @@ def train_policy_deepsup(
     else:
         train_value = False
     
-    # Check if model is hybrid or original TRM
+    # Check if model is ViT Only, EfficientGTrXL, hybrid, or original TRM
     from .models.vit_trm import PolicyValueViT_TRM_Hybrid
+    from .models.vit import PolicyValueViT
+    from .models.efficient_gtrxl import PolicyValueEfficientGTrXL
+    is_vit_only = isinstance(model, PolicyValueViT)
+    is_efficient_gtrxl = isinstance(model, PolicyValueEfficientGTrXL)
     is_hybrid = isinstance(model, PolicyValueViT_TRM_Hybrid)
     
+    # ViT Only or EfficientGTrXL model: use standard supervised learning (no DeepSupervision)
+    if is_vit_only or is_efficient_gtrxl:
+        # Standard ViT/EfficientGTrXL model: just forward pass (no recursion)
+        logits, value = model(states)
+        policy_loss = F.cross_entropy(logits, actions)
+        # Ensure value and rewards have compatible shapes
+        if train_value and rewards is not None:
+            value_loss = F.mse_loss(value.squeeze(-1), rewards)  # value: [B, 1] -> [B], rewards: [B]
+        else:
+            value_loss = torch.tensor(0.0, device=device)
+        
+        # Backward
+        optimizer.zero_grad()
+        total_loss = policy_loss + value_weight * value_loss
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        return float(policy_loss.item()), float(value_loss.item())
+    
+    # TRM models: use DeepSupervision
     # Initialize z for each sample (zeros for supervised learning)
     if is_hybrid:
         z = torch.zeros(B, model.embed_dim, device=device)
@@ -348,12 +382,15 @@ def train_with_simulated_experiences(
 def create_policy_optimizer(model, lr: float = 1e-4) -> torch.optim.Optimizer:
     """
     Create optimizer for policy network (all trainable parameters except value head)
-    Supports both PolicyValueViT_TRM and PolicyValueViT_TRM_Hybrid
+    Supports PolicyValueViT, PolicyValueEfficientGTrXL, PolicyValueViT_TRM, and PolicyValueViT_TRM_Hybrid
     """
     # Check model type by class name to avoid circular import issues
     model_class_name = model.__class__.__name__
     
-    if model_class_name == 'PolicyValueViT_TRM_Hybrid':
+    if model_class_name == 'PolicyValueViT' or model_class_name == 'PolicyValueEfficientGTrXL':
+        # ViT Only or EfficientGTrXL model: train all parameters (policy head included, value head conditionally)
+        policy_params = list(model.parameters())
+    elif model_class_name == 'PolicyValueViT_TRM_Hybrid':
         # Hybrid model: train ViT backbone only during pretraining
         # (TRM is detached, so we only optimize ViT)
         policy_params = list(model.vit.parameters())  # ViT backbone (all params including heads)

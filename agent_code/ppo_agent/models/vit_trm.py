@@ -371,24 +371,21 @@ class PolicyValueViT_TRM_Hybrid(nn.Module):
             mixer="attn",
         )
 
-        # TRM branch (patch embedding with stride/overlap)
+        # TRM branch
+        # IMPORTANT: TRM MUST share the exact same patch embedding as ViT.
+        # That means TRM consumes ViT's patch tokens (and positional embedding) as input.
+        #
+        # We keep `trm_patch_size/trm_patch_stride` in the signature for config compatibility,
+        # but they are not used anymore. If provided values differ from ViT, we warn once.
         if trm_patch_stride is None:
             trm_patch_stride = trm_patch_size
-        self.trm_patch_proj = nn.Conv2d(
-            in_channels,
-            embed_dim,
-            kernel_size=trm_patch_size,
-            stride=trm_patch_stride,
-            padding=0,
-        )
-        h, w = img_size
-        grid_size = (
-            (h - trm_patch_size) // trm_patch_stride + 1,
-            (w - trm_patch_size) // trm_patch_stride + 1,
-        )
-        num_tokens = grid_size[0] * grid_size[1]
-        self.trm_pos_embed = nn.Parameter(torch.zeros(1, num_tokens, embed_dim))
-        nn.init.trunc_normal_(self.trm_pos_embed, std=0.02)
+        if trm_patch_size != vit_patch_size or trm_patch_stride != vit_patch_size:
+            # Sharing is mandatory; ignore TRM-specific patch settings.
+            print(
+                "[PolicyValueViT_TRM_Hybrid] Warning: TRM patch settings are ignored because "
+                "TRM shares ViT patch embedding. "
+                f"(vit_patch_size={vit_patch_size}, trm_patch_size={trm_patch_size}, trm_patch_stride={trm_patch_stride})"
+            )
 
         self.trm_net = TRMRecursiveNet(embed_dim, mlp_ratio=trm_mlp_ratio, drop=trm_drop)
         if use_ema:
@@ -418,12 +415,6 @@ class PolicyValueViT_TRM_Hybrid(nn.Module):
             for ema_param, param in zip(self.trm_net_ema.parameters(), self.trm_net.parameters()):
                 ema_param.data.mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
 
-    def _trm_patch_embed(self, x: torch.Tensor) -> torch.Tensor:
-        x_patches = self.trm_patch_proj(x)  # [B, D, H_p, W_p]
-        B, D, H_p, W_p = x_patches.shape
-        x_embed = x_patches.flatten(2).transpose(1, 2)  # [B, N, D]
-        return x_embed
-
     def _latent_recursion(self, x_embed: torch.Tensor, z: torch.Tensor, n: int) -> torch.Tensor:
         for _ in range(n):
             z = self.trm_net(x_embed, z)
@@ -448,7 +439,10 @@ class PolicyValueViT_TRM_Hybrid(nn.Module):
 
         # TRM residual
         if use_trm:
-            x_embed = self._trm_patch_embed(x) + self.trm_pos_embed  # [B, N, D]
+            # Shared patch tokens from ViT
+            x_embed = self.vit.patch_embed(x)  # [B, N, D]
+            # Shared positional embedding from ViT (no cls token)
+            x_embed = x_embed + self.vit.pos_embed[:, : x_embed.shape[1]]
             if z_prev is None:
                 z = torch.zeros(B, self.embed_dim, device=device)
             else:
@@ -470,4 +464,19 @@ class PolicyValueViT_TRM_Hybrid(nn.Module):
         logits = self.pi_head(fused)
         value = self.v_head(fused).squeeze(-1)
         return logits, value, trm_feat
+
+    def forward_with_z(
+        self,
+        x: torch.Tensor,
+        z_prev: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compatibility helper for recurrent rollouts.
+
+        - If z_prev is None: initialize z to zeros internally.
+        - Always uses TRM branch (use_trm=True) and returns the new latent as z_new.
+        """
+        logits, value, z_new = self.forward(x, z_prev=z_prev, use_trm=True, detach_trm=False)
+        # z_new is the TRM latent feature used for fusion; treat it as recurrent state.
+        return logits, value, z_new
 

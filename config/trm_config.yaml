@@ -5,43 +5,48 @@
 # Model Architecture
 # ------------------
 model:
-  type: "trm"  # "trm" or "vit" (standard)
+  type: "efficient_gtrxl"  # "trm" (ViT+TRM hybrid) or "efficient_gtrxl"
   
   # Vision Transformer base settings
   in_channels: 10  # Must match state_to_features output
   num_actions: 6
   img_size: [17, 17]  # [height, width]
-  embed_dim: 256      # Embedding dimension (Very Large model)
+  embed_dim: 256      # Shared embed dim for ViT & TRM
   
-  # TRM-specific settings
+  # TRM-specific settings (DISABLED - not used)
   trm:
     enabled: true
-    # z_dim is always equal to embed_dim (not configurable)
-    n_latent: 4            # Number of latent recursion steps
-    n_sup: 8               # Number of supervision steps (DeepSupervision)
-    T: 3                   # Deep recursion steps (T-1 no_grad + 1 with grad)
-    use_ema: true          # Use Exponential Moving Average
-    ema_decay: 0.999       # EMA decay factor
+    n_latent: 4
+    n_sup: 8
+    T: 3
+    use_ema: true
+    ema_decay: 0.999
   
   # Patch embedding settings
   patch:
-    size: 2                # Patch size (kernel_size)
-    stride: 1              # Patch stride (stride < size = overlapping patches)
-    # Examples:
-    #   size=1, stride=1: 289 patches (17x17, non-overlapping)
-    #   size=2, stride=1: Overlapping patches (more patches)
-    #   size=2, stride=2: 81 patches (9x9, non-overlapping)
+    size: 1                # Patch size (kernel_size)
+    stride: 1              # Patch stride
   
   # MLP settings
   mlp_ratio: 4.0           # MLP hidden size = embed_dim * mlp_ratio
   dropout: 0.0             # Dropout rate
   
-  # Standard ViT settings (if type="vit")
+  # Standard ViT settings (Enhanced for better performance)
   vit:
-    depth: 2               # Number of transformer blocks
-    num_heads: 4           # Number of attention heads
+    depth: 6               # Increased depth (was 2, now 6)
+    num_heads: 8           # Increased heads (was 4, now 8)
     mixer: "attn"          # "attn" or "gdn"
     use_cls_token: false
+  
+  # EfficientNetB0 + GTrXL settings
+  efficient_gtrxl:
+    # CNN backbone parameters
+    cnn_base_channels: 32  # Base channels for EfficientNet
+    cnn_width_mult: 1.0    # Width multiplier (like EfficientNet scaling)
+    # GTrXL parameters
+    gtrxl_depth: 4         # Number of GTrXL blocks
+    num_heads: 8           # Number of attention heads
+    memory_size: 128       # Memory length for Transformer-XL
 
 
 # Phase 1: Teacher Data Collection
@@ -59,6 +64,7 @@ phase1:
     - "coin_collector_agent"
     - "rule_based_agent"
     - "team_teacher_agent"
+    - "aggressive_teacher_agent"
   
   teacher_agent: "aggressive_teacher_agent"
 
@@ -88,7 +94,7 @@ phase2:
   # DeepSupervision Training
   deepsupervision:
     enabled: true
-    num_epochs: 20        # More epochs for large model
+    num_epochs: 5        # More epochs for large model
     batch_size: 512        # Increased batch size (RTX 4090 has plenty of VRAM)
     learning_rate: 5e-4    # Lower LR for very large model (256-dim)
     

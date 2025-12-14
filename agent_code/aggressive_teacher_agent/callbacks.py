@@ -218,7 +218,9 @@ def act(self, game_state):
     
     # Role - ALL agents are attackers for maximum aggression!
     role = _agent_suffix(self_name)
-    is_attacker = True  # Changed: All agents attack (was: role % 2 == 0)
+    # 전략 완화: 모든 에이전트를 무조건 공격자로 두지 않는다.
+    # 짝수 에이전트만 공격, 홀수는 보수적 탐색/코인 수집에 집중
+    is_attacker = (_agent_suffix(self_name) % 2 == 0)
     
     # Create bomb danger map (like rule_based)
     bomb_map = np.ones(arena.shape) * 5
@@ -277,13 +279,13 @@ def act(self, game_state):
     targets = []
     
     # AGGRESSIVE: ALWAYS prioritize enemies first!
-    if enemies:
-        # Put enemies first in target list - maximum aggression
+    if enemies and is_attacker:
+        # 공격자는 적 우선, 단 중복 우선도 제거
         targets.extend(enemies)
-        targets.extend(enemies)  # Double priority for enemies
         targets.extend(my_coins)
         targets.extend(crates)
     else:
+        # 비공격자는 코인/생존 우선
         targets.extend(my_coins)
         targets.extend(dead_ends)
         targets.extend(crates)
@@ -319,13 +321,12 @@ def act(self, game_state):
     if d == (x, y) and ([arena[x + 1, y], arena[x - 1, y], arena[x, y + 1], arena[x, y - 1]].count(1) > 0):
         action_ideas.append('BOMB')
     
-    # AGGRESSIVE: Bomb when enemy is within 5 tiles (very aggressive range)
-    if enemies:
+    # Bomb: 적이 매우 근접(<=2)하고 시야 확보 + 탈출 가능할 때만
+    if enemies and is_attacker:
         min_enemy_dist = min(abs(ex - x) + abs(ey - y) for ex, ey in enemies)
-        if min_enemy_dist <= 3:
-            # Check if enemy is in line of sight
+        if min_enemy_dist <= 2:
             for ex, ey in enemies:
-                if (ex == x or ey == y) and min_enemy_dist <= 5:
+                if (ex == x or ey == y) and min_enemy_dist <= 2:
                     blocked = False
                     if ex == x:
                         for dy in range(min(y, ey) + 1, max(y, ey)):
@@ -337,9 +338,10 @@ def act(self, game_state):
                             if arena[dx, y] != 0:
                                 blocked = True
                                 break
-                    if not blocked and not teammate_in_blast((x, y), teammates):
+                    # 탈출 경로 존재 확인: bomb_map>2인 안전 타일이 주변에 있는지 체크
+                    safe_exists = any(bomb_map[nx, ny] > 2 for nx, ny in valid_tiles)
+                    if not blocked and safe_exists and not teammate_in_blast((x, y), teammates):
                         action_ideas.append('BOMB')
-                        action_ideas.append('BOMB')  # Higher priority
                         break
     
     # AGGRESSIVE: Bomb when touching enemy or very close!
@@ -353,27 +355,7 @@ def act(self, game_state):
                 action_ideas.append('BOMB')  # Even higher priority for aggression
                 action_ideas.append('BOMB')  # Maximum priority
     
-    # AGGRESSIVE: Bomb when enemy is in blast range
-    if enemies:
-        for ex, ey in enemies:
-            if (ex == x and abs(ey - y) <= s.BOMB_POWER) or \
-               (ey == y and abs(ex - x) <= s.BOMB_POWER):
-                blocked = False
-                if ex == x:
-                    for dy in range(min(y, ey) + 1, max(y, ey)):
-                        if arena[x, dy] != 0:
-                            blocked = True
-                            break
-                else:
-                    for dx in range(min(x, ex) + 1, max(x, ex)):
-                        if arena[dx, y] != 0:
-                            blocked = True
-                            break
-                
-                if not blocked and not teammate_in_blast((x, y), teammates):
-                    action_ideas.append('BOMB')
-                    action_ideas.append('BOMB')  # Higher priority
-                    break
+    # 기존의 먼 거리 폭탄 및 예측 폭탄 로직 제거 → 자살/과잉 폭탄 감소
     
     # AGGRESSIVE: Predict enemy movement and bomb ahead
     if enemies:

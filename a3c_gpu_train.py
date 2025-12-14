@@ -217,36 +217,75 @@ class PerformanceTracker:
 
 def create_model(model_path: str, device: torch.device):
     """Create model (local or global)."""
-    from agent_code.ppo_agent.models.vit import PolicyValueViT
-    import settings as s
-    
-    mixer = os.environ.get("BOMBER_VIT_MIXER", "attn")
-    embed_dim = int(os.environ.get("BOMBER_VIT_DIM", "64"))
-    depth = int(os.environ.get("BOMBER_VIT_DEPTH", "2"))
-    num_heads = int(os.environ.get("BOMBER_VIT_HEADS", "4"))
-    
-    model = PolicyValueViT(
-        in_channels=9,
-        num_actions=6,
-        img_size=(s.COLS, s.ROWS),
-        embed_dim=embed_dim,
-        depth=depth,
-        num_heads=num_heads,
-        mlp_ratio=4.0,
-        drop=0.0,
-        attn_drop=0.0,
-        patch_size=1,
-        use_cls_token=False,
-        mixer=mixer,
-    )
-    
+    # Prefer building the model from our YAML config so the architecture matches
+    # `policy_phase2.pt` (Hybrid ViT+TRM) when BOMBER_FROZEN_VIT / BOMBER_USE_TRM is enabled.
+    # Fallback to env-var ViT-only model if YAML (pyyaml) isn't available.
+    model = None
+    try:
+        from config.load_config import load_config, create_model_from_config  # type: ignore
+        cfg_path = os.environ.get("BOMBER_CONFIG_PATH", "config/trm_config.yaml")
+        cfg = load_config(cfg_path)
+        # strict_yaml=True: YAML 설정을 엄격하게 따르고, 기본값을 사용하지 않음
+        model = create_model_from_config(cfg, device=device, strict_yaml=True)
+    except Exception as e:
+        # Fallback: use env vars or defaults matching YAML (embed_dim=512, depth=6, heads=8)
+        from agent_code.ppo_agent.models.vit import PolicyValueViT
+        import settings as s
+
+        mixer = os.environ.get("BOMBER_VIT_MIXER", "attn")
+        # Increased defaults for better performance (ViT Only)
+        embed_dim = int(os.environ.get("BOMBER_VIT_DIM", "512"))
+        depth = int(os.environ.get("BOMBER_VIT_DEPTH", "6"))
+        num_heads = int(os.environ.get("BOMBER_VIT_HEADS", "8"))
+
+        # NOTE: Our current features are 10 channels; keep this aligned.
+        model = PolicyValueViT(
+            in_channels=10,
+            num_actions=6,
+            img_size=(s.COLS, s.ROWS),
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=4.0,
+            drop=0.0,
+            attn_drop=0.0,
+            patch_size=1,
+            use_cls_token=False,
+            mixer=mixer,
+        )
+
     if os.path.exists(model_path):
         try:
             state_dict = torch.load(model_path, map_location='cpu', weights_only=True)
-            model.load_state_dict(state_dict)
+            # Allow partial load for safety across model variants
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            
+            # Check if checkpoint structure matches model structure
+            # If too many keys are missing, the checkpoint is likely from a different architecture
+            if len(missing_keys) > 0:
+                # Check if checkpoint is from a completely different architecture
+                # ViT keys: patch_embed, blocks.X.norm1 (but not cnn_backbone.blocks)
+                # EfficientGTrXL keys: cnn_backbone, gtrxl_blocks, feature_proj
+                checkpoint_has_vit = any('patch_embed' in k or (k.startswith('blocks.') and 'cnn_backbone' not in k) for k in state_dict.keys())
+                checkpoint_has_gtrxl = any('cnn_backbone' in k or 'gtrxl_blocks' in k or 'feature_proj' in k for k in state_dict.keys())
+                model_has_vit = any('patch_embed' in k or (k.startswith('blocks.') and 'cnn_backbone' not in k) for k in model.state_dict().keys())
+                model_has_gtrxl = any('cnn_backbone' in k or 'gtrxl_blocks' in k or 'feature_proj' in k for k in model.state_dict().keys())
+                
+                if (checkpoint_has_vit and model_has_gtrxl) or (checkpoint_has_gtrxl and model_has_vit):
+                    print(f"[WARNING] Checkpoint architecture mismatch detected!")
+                    print(f"  Checkpoint: {'ViT' if checkpoint_has_vit else 'EfficientGTrXL'}")
+                    print(f"  Model: {'ViT' if model_has_vit else 'EfficientGTrXL'}")
+                    print(f"  Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+                    print(f"  Starting from scratch (checkpoint ignored)")
+                elif len(missing_keys) > len(model.state_dict()) * 0.5:
+                    # More than 50% of keys missing - likely architecture mismatch
+                    print(f"[WARNING] Too many missing keys ({len(missing_keys)}). Starting from scratch.")
+                else:
+                    # Partial load is expected (e.g., only some layers match)
+                    print(f"[INFO] Partial load: {len(missing_keys)} missing, {len(unexpected_keys)} unexpected keys")
         except Exception as e:
-            pass
-    
+            print(f"[WARNING] Failed to load checkpoint: {e}. Starting from scratch.")
+
     model = model.to(device)
     return model
 
@@ -397,16 +436,28 @@ def worker_loop(
         is_selfplay = current_stage >= len(CURRICULUM_STAGES)
         opp1, opp2, stage_name, agent_order = get_opponents_for_stage(current_stage, is_selfplay)
         
-        # Build agent list
-        agent_list = ['ppo_agent', 'ppo_agent', opp1, opp2]
-        shuffled_agents = [agent_list[i] for i in agent_order]
+        # Build agent list.
+        #
+        # IMPORTANT:
+        # `main.py play --train N` marks the *first N agents* in `--agents` as trainable.
+        # If we shuffle across that boundary, opponents like `random_agent` / `peaceful_agent`
+        # can land in the first slots and the engine will try to import
+        # `agent_code.<opponent>.train` (which doesn't exist) → subprocess crash and no stats file.
+        #
+        # So we keep PPO agents in the first 2 positions, and only randomize the opponents order.
+        shuffled_agents = ['ppo_agent', 'ppo_agent']
+        opps = [opp1, opp2]
+        random.shuffle(opps)
+        shuffled_agents += opps
         
         batch_rounds = min(rounds_per_batch, total_rounds - current_round)
         
         # Set environment variables for subprocess - MUST pass via env parameter
         # os.environ changes don't propagate to subprocess automatically
+        # IMPORTANT: Set PPO_MODEL_PATH to match the global model path for initial load
+        # The subprocess will load from global_model_path first, then use local_model_path for saving
         worker_env = os.environ.copy()
-        worker_env['PPO_MODEL_PATH'] = local_model_path
+        worker_env['PPO_MODEL_PATH'] = global_model_path  # Use global model path for initial load
         worker_env['A3C_RESULTS_DIR'] = results_dir  # Pass results_dir so PPO can save stats here
         worker_env['A3C_NUM_WORKERS'] = str(num_workers)  # Also pass worker count for epsilon
         
@@ -434,6 +485,40 @@ def worker_loop(
                 env=worker_env,  # Pass environment variables to subprocess
                 cwd=os.path.dirname(os.path.abspath(__file__))
             )
+            
+            # Debug: Log subprocess errors if any
+            if result.returncode != 0:
+                if local_updates == 0 or local_updates % 50 == 0:  # Log first time and periodically
+                    print(f"[Worker {worker_id}] ❌ Subprocess error (returncode={result.returncode}):")
+                    print(f"[Worker {worker_id}]   Command: {' '.join(cmd)}")
+                    if result.stderr:
+                        print(f"[Worker {worker_id}]   stderr (full):\n{result.stderr}")
+                    if result.stdout:
+                        print(f"[Worker {worker_id}]   stdout (last 1000 chars):\n{result.stdout[-1000:]}")
+            
+            # Debug: Check if output file was created (always log first time, then periodically)
+            if not os.path.exists(output_file):
+                if local_updates == 0 or local_updates % 50 == 0:
+                    print(f"[Worker {worker_id}] ⚠️  Output file not created: {output_file}")
+                    print(f"[Worker {worker_id}]   Subprocess returncode: {result.returncode}")
+                    if result.stderr:
+                        # Print full stderr to see complete error
+                        print(f"[Worker {worker_id}]   stderr (full):\n{result.stderr}")
+                    if result.stdout:
+                        print(f"[Worker {worker_id}]   stdout (last 500 chars):\n{result.stdout[-500:]}")
+            else:
+                # Debug: Check file content (always log first time, then periodically)
+                try:
+                    with open(output_file, 'r') as f:
+                        data = json.load(f)
+                    by_agent = data.get("by_agent", {})
+                    if not by_agent:
+                        if local_updates == 0 or local_updates % 50 == 0:
+                            print(f"[Worker {worker_id}] ⚠️  Output file exists but 'by_agent' is empty")
+                            print(f"[Worker {worker_id}]   File keys: {list(data.keys())}")
+                except Exception as e:
+                    if local_updates == 0 or local_updates % 50 == 0:
+                        print(f"[Worker {worker_id}] ⚠️  Error reading output file: {e}")
             
             # Local model was updated by PPO during game execution
             # Reload it to get latest weights
@@ -497,27 +582,76 @@ def worker_loop(
                 'is_selfplay': is_selfplay,
             }
             
+            # Always try to read output_file (even if it doesn't exist, we'll handle it)
+            file_read_success = False
             if os.path.exists(output_file):
-                with open(output_file, 'r') as f:
-                    data = json.load(f)
-                
-                by_agent = data.get("by_agent", {})
-                for agent_name, stats in by_agent.items():
-                    score = stats.get("score", 0)
-                    kills = stats.get("kills", 0)
-                    deaths = stats.get("suicides", 0)
-                    
-                    if agent_name.startswith("ppo_agent"):
-                        batch_stats['team_a_score'] += score
-                        batch_stats['kills'] += kills
-                        batch_stats['deaths'] += deaths
-                    else:
-                        batch_stats['team_b_score'] += score
-                
                 try:
+                    with open(output_file, 'r') as f:
+                        data = json.load(f)
+                    
+                    by_agent = data.get("by_agent", {})
+                    by_round = data.get("by_round", {})
+                    
+                    # Debug: Log first few times to see what we're getting
+                    if local_updates <= 3:
+                        print(f"[Worker {worker_id}] Debug: by_agent keys: {list(by_agent.keys())}")
+                        if by_agent:
+                            sample_agent = list(by_agent.keys())[0]
+                            print(f"[Worker {worker_id}] Debug: {sample_agent} stats: {by_agent[sample_agent]}")
+                        print(f"[Worker {worker_id}] Debug: by_round count: {len(by_round)}")
+                    
+                    # Aggregate kills from by_round (kills are per-round, not per-agent in JSON)
+                    total_kills = 0
+                    for round_data in by_round.values():
+                        total_kills += round_data.get("kills", 0)
+                    
+                    # Calculate team scores and deaths
+                    ppo_score = 0
+                    opp_score = 0
+                    ppo_deaths = 0
+                    for agent_name, stats in by_agent.items():
+                        score = stats.get("score", 0)
+                        suicides = stats.get("suicides", 0)  # deaths = suicides in JSON
+                        
+                        if agent_name.startswith("ppo_agent"):
+                            batch_stats['team_a_score'] += score
+                            batch_stats['deaths'] += suicides  # Add suicides as deaths
+                            ppo_score += score
+                            ppo_deaths += suicides
+                        else:
+                            batch_stats['team_b_score'] += score
+                            opp_score += score
+                    
+                    # Assign kills: if ppo team scored more, they likely got the kills
+                    # If kills exist and ppo team won (or tied with score > 0), assign kills to ppo
+                    if total_kills > 0:
+                        if ppo_score >= opp_score and ppo_score > 0:
+                            # PPO team won or tied, assign kills to them
+                            batch_stats['kills'] += total_kills
+                        # If opponents won, don't assign kills to ppo (they got killed)
+                    
+                    file_read_success = True
+                    
+                    # Debug: Log stats summary (always log first time, then periodically)
+                    if local_updates == 0 or local_updates % 50 == 0:
+                        print(f"[Worker {worker_id}] Debug: batch_stats = {batch_stats}")
+                        print(f"[Worker {worker_id}] Debug: ppo_score={ppo_score}, opp_score={opp_score}, ppo_deaths={ppo_deaths}, total_kills={total_kills}")
+                except Exception as e:
+                    if local_updates == 0 or local_updates % 50 == 0:
+                        print(f"[Worker {worker_id}] Error parsing output_file: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            # Debug: Log if file was not read successfully
+            if not file_read_success and (local_updates == 0 or local_updates % 50 == 0):
+                print(f"[Worker {worker_id}] ⚠️  Could not read output_file, batch_stats remains: {batch_stats}")
+            
+            # Clean up output file if it exists
+            try:
+                if os.path.exists(output_file):
                     os.remove(output_file)
-                except:
-                    pass
+            except:
+                pass
             
             with global_lock:
                 global_counter.value += batch_rounds
@@ -560,9 +694,11 @@ def worker_loop(
                         current_mtime = os.path.getmtime(global_model_path)
                         if current_mtime > last_sync_mtime:
                             global_weights = torch.load(global_model_path, map_location=device, weights_only=True)
-                            local_model.load_state_dict(global_weights)
-                            torch.save(local_model.state_dict(), local_model_path)
-                            last_sync_mtime = current_mtime
+                            missing, unexpected = local_model.load_state_dict(global_weights, strict=False)
+                            # Only save if load was mostly successful (less than 50% keys missing)
+                            if len(missing) < len(local_model.state_dict()) * 0.5:
+                                torch.save(local_model.state_dict(), local_model_path)
+                                last_sync_mtime = current_mtime
                     except Exception as e:
                         pass  # Silently ignore - will try again next time
             
@@ -574,9 +710,11 @@ def worker_loop(
                     current_mtime = os.path.getmtime(global_model_path)
                     if current_mtime > last_sync_mtime:
                         global_weights = torch.load(global_model_path, map_location=device, weights_only=True)
-                        local_model.load_state_dict(global_weights)
-                        torch.save(local_model.state_dict(), local_model_path)
-                        last_sync_mtime = current_mtime
+                        missing, unexpected = local_model.load_state_dict(global_weights, strict=False)
+                        # Only save if load was mostly successful (less than 50% keys missing)
+                        if len(missing) < len(local_model.state_dict()) * 0.5:
+                            torch.save(local_model.state_dict(), local_model_path)
+                            last_sync_mtime = current_mtime
                 except Exception:
                     pass
         
@@ -783,6 +921,10 @@ def run_adaptive_training(config: Dict):
                     batch_rounds = msg['batch_rounds']
                     teacher_stats = msg.get('teacher_stats')  # Get teacher stats from worker
                     
+                    # Debug: Log first few progress messages to see what we're getting
+                    if round_num <= 100 or round_num % 500 == 0:
+                        print(f"[Debug Round {round_num}] stats from worker: {stats}")
+                    
                     # Update totals
                     total_stats['score'] += stats['team_a_score']
                     total_stats['kills'] += stats['kills']
@@ -927,6 +1069,20 @@ Examples:
                              "0.2 means: 0.8 * workers + 0.2 * global")
     parser.add_argument("--eval-window", type=int, default=200,
                         help="Window for win rate calculation")
+    parser.add_argument(
+        "--model-path",
+        dest="model_path",
+        type=str,
+        default="agent_code/ppo_agent/ppo_model.pt",
+        help="Path to the (global) model checkpoint used for initialization and saving.",
+    )
+    parser.add_argument(
+        "--results-dir",
+        dest="results_dir",
+        type=str,
+        default=None,
+        help="Directory to write worker stats and checkpoints (default: results/weight_avg_<timestamp>)",
+    )
     
     args = parser.parse_args()
     
@@ -939,8 +1095,8 @@ Examples:
         'sync_interval': args.sync_interval,
         'global_weight_ratio': args.global_weight_ratio,
         'eval_window': args.eval_window,
-        'model_path': 'agent_code/ppo_agent/ppo_model.pt',
-        'results_dir': f'results/weight_avg_{timestamp}',
+        'model_path': args.model_path,
+        'results_dir': args.results_dir or f'results/weight_avg_{timestamp}',
     }
     
     run_adaptive_training(config)

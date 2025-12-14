@@ -19,15 +19,19 @@ from typing import List
 from .train import _compute_gae, SHARED
 
 
-def _ppo_update_frozen_vit():
+def _ppo_update_frozen_vit(use_deep_supervision=False):
     """
     PPO 업데이트 (ViT 고정, Value Network와 TRM만 학습)
     
     핵심:
     - ViT 백본: requires_grad = False (고정)
-    - Value Network: requires_grad = True (학습)
+    - Value Network: requires_grad = False (고정)
     - TRM: requires_grad = True (학습)
-    - Policy Head: requires_grad = True (학습, TRM과 연결되어 있으므로)
+    - Policy Head: requires_grad = False (고정)
+    
+    Args:
+        use_deep_supervision: If True, apply DeepSupervision (multiple recursive reasoning steps)
+                             for each (state, action) pair. Only used in Planning updates.
     """
     SHARED.policy.train()
 
@@ -39,6 +43,9 @@ def _ppo_update_frozen_vit():
     values = torch.tensor(SHARED.buf_values, dtype=torch.float32, device=device)    # [T]
     rewards = torch.tensor(SHARED.buf_rewards, dtype=torch.float32, device=device)  # [T]
     dones = torch.tensor(SHARED.buf_dones, dtype=torch.bool, device=device)         # [T]
+    # Recurrent z is disabled by default in the new design (to avoid collapse).
+    # We always use z_prev=None (zero init) in PPO updates.
+    z_prev_all = None
 
     adv, returns = _compute_gae(
         rewards.tolist(), values.tolist(), dones.tolist(),
@@ -60,27 +67,29 @@ def _ppo_update_frozen_vit():
         for param in SHARED.policy.vit.parameters():
             param.requires_grad = False
         
-        # Enable gradients for Value Network (hybrid model's own v_head)
+        # Freeze Value Network
         for param in SHARED.policy.v_head.parameters():
-            param.requires_grad = True
+            param.requires_grad = False
         
-        # Enable gradients for TRM
-        for param in SHARED.policy.trm_patch_proj.parameters():
-            param.requires_grad = True
-        SHARED.policy.trm_pos_embed.requires_grad = True
+        # Enable gradients for TRM only
         for param in SHARED.policy.trm_net.parameters():
             param.requires_grad = True
         
-        # Enable gradients for Policy Head (TRM과 연결되어 있으므로)
+        # Freeze Policy Head
         for param in SHARED.policy.pi_head.parameters():
-            param.requires_grad = True
+            param.requires_grad = False
         
-        print(f"[Frozen ViT] ViT 백본 고정, Value Network와 TRM만 학습")
+        print(f"[Frozen ViT] ViT 백본 + Value Network + Policy Head 고정, TRM만 학습")
     else:
         # Original TRM model - freeze patch embedding and ViT-like components if any
         # For now, assume all parameters are trainable except we'll handle it differently
         print(f"[Frozen ViT] Original TRM model - all parameters trainable")
 
+    # Get n_sup for DeepSupervision (if applicable)
+    n_sup = 4  # Default
+    if use_deep_supervision and is_hybrid:
+        n_sup = getattr(SHARED.policy, 'trm_n_sup', 4)
+    
     for _ in range(SHARED.update_epochs):
         perm = torch.randperm(T)
         for start in range(0, T, SHARED.batch_size):
@@ -92,44 +101,87 @@ def _ppo_update_frozen_vit():
             mb_returns = returns[mb_idx]
             mb_dones = dones[mb_idx]
 
-            # Forward pass
-            if is_hybrid:
-                # Use TRM during RL (use_trm=True, detach_trm=False)
-                logits, values_pred, _ = SHARED.policy.forward(
-                    mb_states,
-                    z_prev=None,  # Will be initialized to zero
-                    use_trm=True,
-                    detach_trm=False,  # TRM gradients enabled
-                )
+            if use_deep_supervision and is_hybrid:
+                # DeepSupervision: Apply multiple recursive reasoning steps
+                # Each supervision step contributes to learning (like train_deepsup.py)
+                B = mb_states.size(0)
+                step_policy_losses = []
+                step_value_losses = []
+                
+                # Initialize z for each sample (zeros)
+                z_prev = None  # Always zero init in non-recurrent mode
+                
+                # Apply DeepSupervision: n_sup recursive reasoning steps
+                for sup_step in range(n_sup):
+                    # Forward pass with recursive reasoning (TRM)
+                    logits, values_pred, z_new = SHARED.policy.forward_with_z(
+                        mb_states,
+                        z_prev=z_prev,
+                    )
+                    
+                    # Compute loss at each supervision step
+                    dist = torch.distributions.Categorical(logits=logits)
+                    new_logps = dist.log_prob(mb_actions)
+                    
+                    ratio = torch.exp(new_logps - mb_old_logps)
+                    surr1 = ratio * mb_adv
+                    surr2 = torch.clamp(ratio, 1.0 - SHARED.clip_range, 1.0 + SHARED.clip_range) * mb_adv
+                    step_policy_loss = -torch.min(surr1, surr2).mean()
+                    step_policy_losses.append(step_policy_loss)
+                    
+                    step_value_loss = nn.functional.mse_loss(values_pred, mb_returns)
+                    step_value_losses.append(step_value_loss)
+                    
+                    # Detach z to avoid very long BPTT chains (per-step supervision)
+                    z_prev = z_new.detach()
+                
+                # Average losses across all supervision steps
+                policy_loss = torch.stack(step_policy_losses).mean()
+                value_loss = torch.stack(step_value_losses).mean()
+                
+                # Entropy (use final prediction)
+                dist = torch.distributions.Categorical(logits=logits)
+                entropy = dist.entropy().mean()
+                
+                loss = policy_loss + SHARED.vf_coef * value_loss - SHARED.ent_coef * entropy
+                
             else:
-                # Original TRM model
-                logits, values_pred = SHARED.policy(mb_states)
-            
-            dist = torch.distributions.Categorical(logits=logits)
-            new_logps = dist.log_prob(mb_actions)
-            entropy = dist.entropy().mean()
+                # Standard PPO update (no DeepSupervision)
+                # Forward pass
+                if is_hybrid:
+                    # Use TRM during RL (use_trm=True, detach_trm=False)
+                    logits, values_pred, _ = SHARED.policy.forward(
+                        mb_states,
+                        z_prev=None,  # always zero init
+                        use_trm=True,
+                        detach_trm=False,  # TRM gradients enabled
+                    )
+                else:
+                    # Original TRM model
+                    logits, values_pred = SHARED.policy(mb_states)
+                
+                dist = torch.distributions.Categorical(logits=logits)
+                new_logps = dist.log_prob(mb_actions)
+                entropy = dist.entropy().mean()
 
-            ratio = torch.exp(new_logps - mb_old_logps)
-            surr1 = ratio * mb_adv
-            surr2 = torch.clamp(ratio, 1.0 - SHARED.clip_range, 1.0 + SHARED.clip_range) * mb_adv
-            policy_loss = -torch.min(surr1, surr2).mean()
+                ratio = torch.exp(new_logps - mb_old_logps)
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1.0 - SHARED.clip_range, 1.0 + SHARED.clip_range) * mb_adv
+                policy_loss = -torch.min(surr1, surr2).mean()
 
-            value_loss = nn.functional.mse_loss(values_pred, mb_returns)
+                value_loss = nn.functional.mse_loss(values_pred, mb_returns)
 
-            loss = policy_loss + SHARED.vf_coef * value_loss - SHARED.ent_coef * entropy
+                loss = policy_loss + SHARED.vf_coef * value_loss - SHARED.ent_coef * entropy
 
             SHARED.optimizer.zero_grad()
             loss.backward()
             
             # Only clip gradients for trainable parameters
             if is_hybrid:
-                # Collect trainable parameters (Value Network + TRM + Policy Head)
+                # Collect trainable parameters (TRM only, Value Network와 Policy Head 제외)
                 trainable_params = []
-                trainable_params.extend(list(SHARED.policy.v_head.parameters()))
-                trainable_params.extend(list(SHARED.policy.trm_patch_proj.parameters()))
-                trainable_params.append(SHARED.policy.trm_pos_embed)
                 trainable_params.extend(list(SHARED.policy.trm_net.parameters()))
-                trainable_params.extend(list(SHARED.policy.pi_head.parameters()))
+                # Value Network와 Policy Head는 제외 (고정)
             else:
                 trainable_params = list(SHARED.policy.parameters())
             
@@ -144,24 +196,18 @@ def _ppo_update_frozen_vit():
 
 def setup_frozen_vit_optimizer():
     """
-    Optimizer 설정 (ViT 제외, Value Network와 TRM만)
+    Optimizer 설정 (ViT + Value Network + Policy Head 제외, TRM만)
     """
     from .models.vit_trm import PolicyValueViT_TRM_Hybrid
     
     if isinstance(SHARED.policy, PolicyValueViT_TRM_Hybrid):
-        # Collect only trainable parameters
+        # Collect only trainable parameters (TRM only)
         trainable_params = []
         
-        # Value Network
-        trainable_params.extend(list(SHARED.policy.v_head.parameters()))
-        
-        # TRM components
-        trainable_params.extend(list(SHARED.policy.trm_patch_proj.parameters()))
-        trainable_params.append(SHARED.policy.trm_pos_embed)
+        # TRM components only
         trainable_params.extend(list(SHARED.policy.trm_net.parameters()))
         
-        # Policy Head (TRM과 연결되어 있으므로)
-        trainable_params.extend(list(SHARED.policy.pi_head.parameters()))
+        # Value Network와 Policy Head는 제외 (고정)
         
         # Create optimizer with only trainable parameters
         SHARED.optimizer = torch.optim.AdamW(
@@ -171,9 +217,11 @@ def setup_frozen_vit_optimizer():
             eps=1e-8
         )
         
-        print(f"[Frozen ViT Optimizer] Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+        print(f"[Frozen ViT Optimizer] Trainable parameters (TRM only): {sum(p.numel() for p in trainable_params):,}")
         print(f"[Frozen ViT Optimizer] Total parameters: {sum(p.numel() for p in SHARED.policy.parameters()):,}")
         print(f"[Frozen ViT Optimizer] Frozen (ViT): {sum(p.numel() for p in SHARED.policy.vit.parameters()):,}")
+        print(f"[Frozen ViT Optimizer] Frozen (Value Network): {sum(p.numel() for p in SHARED.policy.v_head.parameters()):,}")
+        print(f"[Frozen ViT Optimizer] Frozen (Policy Head): {sum(p.numel() for p in SHARED.policy.pi_head.parameters()):,}")
     else:
         # Original TRM model - use all parameters
         SHARED.optimizer = torch.optim.AdamW(

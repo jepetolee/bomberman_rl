@@ -110,51 +110,82 @@ def apply_preset(config: Dict[str, Any], preset_name: str) -> Dict[str, Any]:
     return config
 
 
-def create_model_from_config(config: Dict[str, Any], device=None):
+def create_model_from_config(config: Dict[str, Any], device=None, strict_yaml=True):
     """
-    Create TRM model from configuration
+    Create model from configuration
     
     Args:
         config: Configuration dictionary
         device: PyTorch device
+        strict_yaml: If True, require all parameters to be explicitly set in YAML (no defaults)
     
     Returns:
-        Initialized model
+        Initialized model (PolicyValueViT or PolicyValueEfficientGTrXL)
     """
     import torch
-    from agent_code.ppo_agent.models.vit_trm import PolicyValueViT_TRM_Hybrid
     import settings as s
     
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model_cfg = get_model_config(config)
-    trm_cfg = model_cfg.get('trm', {})
-    patch_cfg = model_cfg.get('patch', {})
-    vit_cfg = model_cfg.get('vit', {})
+    model_type = model_cfg.get('type', 'vit').lower()
     
-    # Use hybrid model: ViT backbone + TRM residual
-    # For pretraining: use_trm=False (ViT only)
-    # For RL: use_trm=True (ViT + TRM)
-    model = PolicyValueViT_TRM_Hybrid(
-        in_channels=model_cfg.get('in_channels', 10),
-        num_actions=model_cfg.get('num_actions', 6),
-        img_size=tuple(model_cfg.get('img_size', [s.ROWS, s.COLS])),
-        embed_dim=model_cfg.get('embed_dim', 64),
-        # ViT backbone params
-        vit_depth=vit_cfg.get('depth', 2),
-        vit_heads=vit_cfg.get('num_heads', 4),
-        vit_mlp_ratio=model_cfg.get('mlp_ratio', 4.0),
-        vit_patch_size=patch_cfg.get('size', 1),
-        # TRM settings
-        trm_n_latent=trm_cfg.get('n_latent', 6),
-        trm_mlp_ratio=model_cfg.get('mlp_ratio', 4.0),
-        trm_drop=model_cfg.get('dropout', 0.0),
-        trm_patch_size=patch_cfg.get('size', 2),
-        trm_patch_stride=patch_cfg.get('stride', 1),
-        use_ema=trm_cfg.get('use_ema', True),
-        ema_decay=trm_cfg.get('ema_decay', 0.999),
-    ).to(device)
+    if model_type == 'efficient_gtrxl':
+        # EfficientNetB0 + GTrXL model
+        from agent_code.ppo_agent.models.efficient_gtrxl import PolicyValueEfficientGTrXL
+        eff_cfg = model_cfg.get('efficient_gtrxl', {})
+        
+        # Strict mode: require all parameters in YAML
+        if strict_yaml:
+            required_keys = ['cnn_base_channels', 'cnn_width_mult', 'gtrxl_depth', 'num_heads', 'memory_size']
+            missing = [k for k in required_keys if k not in eff_cfg]
+            if missing:
+                raise ValueError(f"YAML에 필수 EfficientGTrXL 설정이 없습니다: {missing}. "
+                               f"config/trm_config.yaml의 model.efficient_gtrxl 섹션에 명시해야 합니다.")
+            if 'embed_dim' not in model_cfg:
+                raise ValueError("YAML에 embed_dim이 없습니다. config/trm_config.yaml의 model 섹션에 명시해야 합니다.")
+            if 'in_channels' not in model_cfg:
+                raise ValueError("YAML에 in_channels가 없습니다. config/trm_config.yaml의 model 섹션에 명시해야 합니다.")
+            if 'num_actions' not in model_cfg:
+                raise ValueError("YAML에 num_actions가 없습니다. config/trm_config.yaml의 model 섹션에 명시해야 합니다.")
+        
+        model = PolicyValueEfficientGTrXL(
+            in_channels=model_cfg['in_channels'] if strict_yaml else model_cfg.get('in_channels', 10),
+            num_actions=model_cfg['num_actions'] if strict_yaml else model_cfg.get('num_actions', 6),
+            img_size=tuple(model_cfg.get('img_size', [s.ROWS, s.COLS])),
+            # CNN parameters
+            cnn_base_channels=eff_cfg['cnn_base_channels'] if strict_yaml else eff_cfg.get('cnn_base_channels', 32),
+            cnn_width_mult=eff_cfg['cnn_width_mult'] if strict_yaml else eff_cfg.get('cnn_width_mult', 1.0),
+            # Transformer parameters
+            embed_dim=model_cfg['embed_dim'] if strict_yaml else model_cfg.get('embed_dim', 512),
+            gtrxl_depth=eff_cfg['gtrxl_depth'] if strict_yaml else eff_cfg.get('gtrxl_depth', 4),
+            num_heads=eff_cfg['num_heads'] if strict_yaml else eff_cfg.get('num_heads', 8),
+            mlp_ratio=model_cfg.get('mlp_ratio', 4.0),
+            dropout=model_cfg.get('dropout', 0.0),
+            # Memory
+            memory_size=eff_cfg['memory_size'] if strict_yaml else eff_cfg.get('memory_size', 256),
+        ).to(device)
+    else:
+        # ViT Only model (default)
+        from agent_code.ppo_agent.models.vit import PolicyValueViT
+        patch_cfg = model_cfg.get('patch', {})
+        vit_cfg = model_cfg.get('vit', {})
+        
+        model = PolicyValueViT(
+            in_channels=model_cfg.get('in_channels', 10),
+            num_actions=model_cfg.get('num_actions', 6),
+            img_size=tuple(model_cfg.get('img_size', [s.ROWS, s.COLS])),
+            embed_dim=model_cfg.get('embed_dim', 512),  # Increased default
+            depth=vit_cfg.get('depth', 6),  # Increased default
+            num_heads=vit_cfg.get('num_heads', 8),  # Increased default
+            mlp_ratio=model_cfg.get('mlp_ratio', 4.0),
+            drop=model_cfg.get('dropout', 0.0),
+            attn_drop=0.0,
+            patch_size=patch_cfg.get('size', 1),
+            use_cls_token=vit_cfg.get('use_cls_token', False),
+            mixer=vit_cfg.get('mixer', 'attn'),
+        ).to(device)
     
     return model
 

@@ -30,13 +30,17 @@ PHASE2_MODEL=${3:-"data/policy_models/policy_phase2.pt"}
 # Set environment variables for TRM recurrent mode
 export BOMBER_USE_TRM=1
 export BOMBER_TRM_RECURRENT=1
+# Default to frozen ViT (train TRM + value while keeping ViT features fixed).
+# Override by exporting BOMBER_FROZEN_VIT=0 if you want full fine-tuning.
+export BOMBER_FROZEN_VIT=${BOMBER_FROZEN_VIT:-1}
 export BOMBER_TRM_N=6
 export BOMBER_TRM_T=3
 export BOMBER_TRM_N_SUP=16
-export BOMBER_TRM_Z_DIM=64
+# Note: z_dim is always equal to embed_dim (not configurable separately)
+# export BOMBER_TRM_Z_DIM=256  # Deprecated: z_dim = embed_dim automatically
 
-# ViT configuration
-export BOMBER_VIT_DIM=64
+# ViT configuration (matches policy_phase2.pt checkpoint)
+export BOMBER_VIT_DIM=256
 export BOMBER_VIT_DEPTH=2
 export BOMBER_VIT_HEADS=4
 

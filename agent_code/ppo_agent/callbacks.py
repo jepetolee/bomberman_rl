@@ -27,14 +27,16 @@ def _to_device() -> torch.device:
 
 
 from .models.vit import PolicyValueViT
-from .models.vit_trm import PolicyValueViT_TRM
+from .models.vit_trm import PolicyValueViT_TRM, PolicyValueViT_TRM_Hybrid
 
 
 class _Shared:
     def __init__(self):
         self.device = _to_device()
         # Allow overriding model path via env; default to local file
-        self.model_path = os.environ.get("PPO_MODEL_PATH", "ppo_model.pt")
+        # Default to policy_phase2.pt if available, otherwise fallback to ppo_model.pt
+        default_model_path = "data/policy_models/policy_phase2.pt" if os.path.exists("data/policy_models/policy_phase2.pt") else "ppo_model.pt"
+        self.model_path = os.environ.get("PPO_MODEL_PATH", default_model_path)
         self.policy: Optional[nn.Module] = None
         self.optimizer: Optional[torch.optim.Optimizer] = None
 
@@ -69,11 +71,11 @@ class _Shared:
         # Count of finished rounds across all agents (incremented when a round fully wraps up)
         self.completed_rounds = 0
 
-        # Suicide penalty schedule: start high, then reduce after a switch round
+        # Suicide penalty schedule: start high, keep high to prevent suicide
         try:
-            self.suicide_penalty_high = float(os.environ.get("PPO_SUICIDE_HIGH", "-15"))
+            self.suicide_penalty_high = float(os.environ.get("PPO_SUICIDE_HIGH", "-30"))
         except Exception:
-            self.suicide_penalty_high = -15.0
+            self.suicide_penalty_high = -30.0  # Increased from -15.0 to strongly discourage suicide
         try:
             self.suicide_penalty_after = float(os.environ.get("PPO_SUICIDE_AFTER", "nan"))  # NaN -> use default
         except Exception:
@@ -122,43 +124,128 @@ class _Shared:
         
         if self.policy is None:
             use_trm = os.environ.get("BOMBER_USE_TRM", "0") == "1"
+            use_frozen_vit = os.environ.get("BOMBER_FROZEN_VIT", "0") == "1"
             
-            if use_trm:
-                # TRM model
-                embed_dim = int(os.environ.get("BOMBER_VIT_DIM", 64))
+            # Try to load config from YAML first and use create_model_from_config if available
+            try:
+                from config.load_config import load_config, get_model_config, create_model_from_config
+                cfg_path = os.environ.get("BOMBER_CONFIG_PATH", "config/trm_config.yaml")
+                config = load_config(cfg_path)
+                model_cfg = get_model_config(config)
+                model_type = model_cfg.get('type', 'vit').lower()
+                
+                # If YAML specifies efficient_gtrxl, use create_model_from_config
+                # strict_yaml=True: YAML 설정을 엄격하게 따르고, 기본값을 사용하지 않음
+                if model_type == 'efficient_gtrxl':
+                    self.policy = create_model_from_config(config, device=self.device, strict_yaml=True)
+                    # Skip the rest of the manual model creation
+                    # Load checkpoint if available
+                    reset_requested = os.environ.get("PPO_RESET", "0") == "1"
+                    if (not reset_requested) and os.path.isfile(self.model_path):
+                        try:
+                            logger.info(f"Loading PPO model from '{self.model_path}'.")
+                            state = torch.load(self.model_path, map_location=self.device, weights_only=True)
+                            missing_keys, unexpected_keys = self.policy.load_state_dict(state, strict=False)
+                            
+                            if missing_keys or unexpected_keys:
+                                # Check for architecture mismatch
+                                # ViT keys: patch_embed, blocks.X.norm1 (but not cnn_backbone.blocks)
+                                # EfficientGTrXL keys: cnn_backbone, gtrxl_blocks, feature_proj
+                                checkpoint_has_vit = any('patch_embed' in k or (k.startswith('blocks.') and 'cnn_backbone' not in k) for k in state.keys())
+                                checkpoint_has_gtrxl = any('cnn_backbone' in k or 'gtrxl_blocks' in k or 'feature_proj' in k for k in state.keys())
+                                model_has_vit = any('patch_embed' in k or (k.startswith('blocks.') and 'cnn_backbone' not in k) for k in self.policy.state_dict().keys())
+                                model_has_gtrxl = any('cnn_backbone' in k or 'gtrxl_blocks' in k or 'feature_proj' in k for k in self.policy.state_dict().keys())
+                                
+                                if (checkpoint_has_vit and model_has_gtrxl) or (checkpoint_has_gtrxl and model_has_vit):
+                                    logger.warning(f"Architecture mismatch: Checkpoint is {'ViT' if checkpoint_has_vit else 'EfficientGTrXL'}, "
+                                                 f"but model is {'ViT' if model_has_vit else 'EfficientGTrXL'}. Starting from scratch.")
+                                    # Reinitialize model
+                                    from config.load_config import create_model_from_config
+                                    config = load_config(cfg_path)
+                                    self.policy = create_model_from_config(config, device=self.device, strict_yaml=True)
+                                elif len(missing_keys) > len(self.policy.state_dict()) * 0.5:
+                                    logger.warning(f"Too many missing keys ({len(missing_keys)}/{len(self.policy.state_dict())}). Starting from scratch.")
+                                    # Reinitialize model
+                                    from config.load_config import create_model_from_config
+                                    config = load_config(cfg_path)
+                                    self.policy = create_model_from_config(config, device=self.device, strict_yaml=True)
+                                else:
+                                    logger.info(f"Partial load: {len(missing_keys)} missing, {len(unexpected_keys)} unexpected keys")
+                        except Exception as e:
+                            logger.warning(f"Failed to load checkpoint: {e}. Starting from scratch.")
+                    return
+                trm_cfg = model_cfg.get('trm', {})
+                patch_cfg = model_cfg.get('patch', {})
+                vit_cfg = model_cfg.get('vit', {})
+                
+                # Use YAML values with env var override
+                embed_dim = int(os.environ.get("BOMBER_VIT_DIM", model_cfg.get('embed_dim', 512)))  # Increased default
+                z_dim = embed_dim  # z_dim always equals embed_dim
+                n_latent = int(os.environ.get("BOMBER_TRM_N", trm_cfg.get('n_latent', 4)))
+                n_sup = int(os.environ.get("BOMBER_TRM_N_SUP", trm_cfg.get('n_sup', 8)))
+                T = int(os.environ.get("BOMBER_TRM_T", trm_cfg.get('T', 3)))
+                use_ema = os.environ.get("BOMBER_TRM_EMA", "0") != "0" if not trm_cfg.get('use_ema', True) else True
+                ema_decay = float(os.environ.get("BOMBER_TRM_EMA", str(trm_cfg.get('ema_decay', 0.999))))
+                patch_size = int(os.environ.get("BOMBER_TRM_PATCH_SIZE", patch_cfg.get('size', 1)))
+                patch_stride = int(os.environ.get("BOMBER_TRM_PATCH_STRIDE", patch_cfg.get('stride', 1)))
+                vit_depth = int(os.environ.get("BOMBER_VIT_DEPTH", vit_cfg.get('depth', 6)))  # Increased default
+                vit_heads = int(os.environ.get("BOMBER_VIT_HEADS", vit_cfg.get('num_heads', 8)))  # Increased default
+            except Exception:
+                # Fallback to env vars only
+                embed_dim = int(os.environ.get("BOMBER_VIT_DIM", 512))  # Increased default
                 z_dim = int(os.environ.get("BOMBER_TRM_Z_DIM", str(embed_dim)))
                 n_latent = int(os.environ.get("BOMBER_TRM_N", "6"))
                 n_sup = int(os.environ.get("BOMBER_TRM_N_SUP", "16"))
                 T = int(os.environ.get("BOMBER_TRM_T", "3"))
                 use_ema = os.environ.get("BOMBER_TRM_EMA", "0.999") != "0"
                 ema_decay = float(os.environ.get("BOMBER_TRM_EMA", "0.999"))
-                
-                # Patch configuration: smaller patch_size and/or overlapping patches
-                patch_size = int(os.environ.get("BOMBER_TRM_PATCH_SIZE", "1"))
-                patch_stride = int(os.environ.get("BOMBER_TRM_PATCH_STRIDE", str(patch_size)))
-                
-                self.policy = PolicyValueViT_TRM(
+                patch_size = int(os.environ.get("BOMBER_TRM_PATCH_SIZE", "1"))  # Default to 1
+                patch_stride = int(os.environ.get("BOMBER_TRM_PATCH_STRIDE", "1"))
+                vit_depth = int(os.environ.get("BOMBER_VIT_DEPTH", 6))  # Increased default
+                vit_heads = int(os.environ.get("BOMBER_VIT_HEADS", 8))  # Increased default
+            
+            if use_trm:
+                # Always use Hybrid model (ViT backbone + TRM residual)
+                # This matches the model saved by train_phase2.py (policy_phase2.pt)
+                # Frozen ViT mode (BOMBER_FROZEN_VIT=1): Only TRM is trained
+                # Non-frozen mode (BOMBER_FROZEN_VIT=0): All parameters are trained
+                self.policy = PolicyValueViT_TRM_Hybrid(
                     in_channels=10,
                     num_actions=len(ACTIONS),
                     img_size=(s.COLS, s.ROWS),
                     embed_dim=embed_dim,
-                    z_dim=z_dim,
-                    n_latent=n_latent,
-                    n_sup=n_sup,
-                    T=T,
-                    mlp_ratio=4.0,
-                    drop=0.0,
-                    patch_size=patch_size,
-                    patch_stride=patch_stride,
+                    vit_depth=vit_depth,
+                    vit_heads=vit_heads,
+                    vit_mlp_ratio=4.0,
+                    vit_patch_size=patch_size,  # Use YAML patch_size
+                    trm_n_latent=n_latent,
+                    trm_mlp_ratio=4.0,
+                    trm_drop=0.0,
+                    trm_patch_size=patch_size,
+                    trm_patch_stride=patch_stride,
                     use_ema=use_ema,
                     ema_decay=ema_decay,
                 ).to(self.device)
             else:
                 # Standard ViT model
                 mixer = os.environ.get("BOMBER_VIT_MIXER", "attn")
-                embed_dim = int(os.environ.get("BOMBER_VIT_DIM", 64))
-                depth = int(os.environ.get("BOMBER_VIT_DEPTH", 2))
-                num_heads = int(os.environ.get("BOMBER_VIT_HEADS", 4))
+                # Use YAML embed_dim if available, otherwise default to 256
+                # Note: embed_dim may already be defined if use_trm was True, but depth/num_heads are not
+                try:
+                    from config.load_config import load_config, get_model_config
+                    cfg_path = os.environ.get("BOMBER_CONFIG_PATH", "config/trm_config.yaml")
+                    config = load_config(cfg_path)
+                    model_cfg = get_model_config(config)
+                    vit_cfg = model_cfg.get('vit', {})
+                    if 'embed_dim' not in locals():
+                        embed_dim = int(os.environ.get("BOMBER_VIT_DIM", model_cfg.get('embed_dim', 512)))  # Increased default
+                    depth = int(os.environ.get("BOMBER_VIT_DEPTH", vit_cfg.get('depth', 6)))  # Increased default
+                    num_heads = int(os.environ.get("BOMBER_VIT_HEADS", vit_cfg.get('num_heads', 8)))  # Increased default
+                except Exception:
+                    if 'embed_dim' not in locals():
+                        embed_dim = int(os.environ.get("BOMBER_VIT_DIM", 512))  # Increased default
+                    depth = int(os.environ.get("BOMBER_VIT_DEPTH", 6))  # Increased default
+                    num_heads = int(os.environ.get("BOMBER_VIT_HEADS", 8))  # Increased default
                 self.policy = PolicyValueViT(
                     in_channels=10,
                     num_actions=len(ACTIONS),
@@ -178,12 +265,27 @@ class _Shared:
             if (not reset_requested) and os.path.isfile(self.model_path):
                 try:
                     logger.info(f"Loading PPO model from '{self.model_path}'.")
-                    state = torch.load(self.model_path, map_location=self.device,weights_only=True)
-                    self.policy.load_state_dict(state)
+                    state = torch.load(self.model_path, map_location=self.device, weights_only=True)
+                    
+                    # Try strict load first
+                    try:
+                        missing_keys, unexpected_keys = self.policy.load_state_dict(state, strict=False)
+                        if missing_keys or unexpected_keys:
+                            logger.info(f"Partial load: {len(missing_keys)} missing keys, {len(unexpected_keys)} unexpected keys")
+                            if missing_keys and len(missing_keys) < 50:  # Only log if not too many
+                                logger.debug(f"Missing keys (first 10): {missing_keys[:10]}")
+                            if unexpected_keys and len(unexpected_keys) < 50:
+                                logger.debug(f"Unexpected keys (first 10): {unexpected_keys[:10]}")
+                    except Exception as e:
+                        # If strict=False also fails, log and continue with random init
+                        logger.warning(f"Failed to load state_dict (partial): {e}")
+                        logger.info("Continuing with randomly initialized weights.")
+                    
                     # Track model file modification time for A3C workers
                     self._last_model_mtime = os.path.getmtime(self.model_path)
                 except Exception as ex:
                     logger.warning(f"Failed to load PPO model from '{self.model_path}': {ex}")
+                    logger.info("Continuing with randomly initialized weights.")
             else:
                 logger.info("Starting with randomly initialized PPO weights.")
         
@@ -198,9 +300,13 @@ class _Shared:
                 if current_mtime > self._last_model_mtime:
                     # Model file was updated, reload it
                     state = torch.load(self.model_path, map_location=self.device, weights_only=True)
-                    self.policy.load_state_dict(state)
+                    # Use strict=False for reloads to handle architecture changes
+                    missing_keys, unexpected_keys = self.policy.load_state_dict(state, strict=False)
                     self._last_model_mtime = current_mtime
-                    logger.debug(f"Reloaded updated PPO model (mtime: {current_mtime})")
+                    if missing_keys or unexpected_keys:
+                        logger.debug(f"Reloaded updated PPO model (mtime: {current_mtime}, {len(missing_keys)} missing, {len(unexpected_keys)} unexpected)")
+                    else:
+                        logger.debug(f"Reloaded updated PPO model (mtime: {current_mtime})")
             except Exception as ex:
                 pass  # Silently ignore reload errors to avoid spam
 
@@ -219,6 +325,8 @@ class _Shared:
         self.buf_values = []
         self.buf_rewards = []
         self.buf_dones = []
+        # Optional recurrent latent buffer (z_prev per step). Used by planning and recurrent PPO.
+        self.buf_z_prev = []
 
     def current_epsilon(self) -> float:
         if self.eps_decay_rounds <= 0:
@@ -302,12 +410,15 @@ def setup(self):
     # Recurrent TRM latent state management
     self._current_z: Optional[torch.Tensor] = None
     self._last_round = -1
+    # Disable recurrent carry unless explicitly enabled
+    self._use_recurrent_z = os.environ.get("BOMBER_TRM_RECURRENT", "0") == "1"
 
     # Runtime scratch vars used between act() and game_events_occurred()
     self._last_state_tensor: Optional[torch.Tensor] = None
     self._last_action_idx: Optional[int] = None
     self._last_log_prob: Optional[float] = None
     self._last_value: Optional[float] = None
+    self._last_z_prev: Optional[torch.Tensor] = None
 
 
 def act(self, game_state: dict) -> str:
@@ -322,17 +433,56 @@ def act(self, game_state: dict) -> str:
     obs = state_to_features(game_state)
     x = torch.from_numpy(obs).unsqueeze(0).to(self.device)  # [1, C, H, W]
     
+    # Danger mask: avoid stepping into tiles about to explode (timer <=1 or explosion active)
+    def _mask_unsafe_logits(logits: torch.Tensor) -> torch.Tensor:
+        bombs = game_state.get('bombs', [])
+        explosion_map = game_state.get('explosion_map', np.zeros((s.COLS, s.ROWS)))
+        _, _, _, (cx, cy) = game_state['self']
+        danger = set()
+        # existing explosions
+        for ix in range(explosion_map.shape[0]):
+            for iy in range(explosion_map.shape[1]):
+                if explosion_map[ix, iy] > 0:
+                    danger.add((ix, iy))
+        # bombs with timer<=1
+        for (bx, by), t in bombs:
+            if t <= 1:
+                for dx, dy in [(0,0),(1,0),(-1,0),(0,1),(0,-1),(2,0),(-2,0),(0,2),(0,-2),(3,0),(-3,0),(0,3),(0,-3)]:
+                    nx, ny = bx+dx, by+dy
+                    if 0 <= nx < s.COLS and 0 <= ny < s.ROWS:
+                        danger.add((nx, ny))
+        # action deltas
+        deltas = {'UP': (0, -1), 'DOWN': (0, 1), 'LEFT': (-1, 0), 'RIGHT': (1, 0), 'WAIT': (0,0)}
+        logits = logits.clone()
+        for idx, act in enumerate(ACTIONS):
+            if act == 'BOMB':
+                continue
+            dx, dy = deltas.get(act, (0,0))
+            nx, ny = cx + dx, cy + dy
+            if (nx, ny) in danger:
+                logits[:, idx] = -1e9
+        return logits
+
     with torch.no_grad():
         # Check if policy supports recurrent z (TRM model)
         if hasattr(self.policy, 'forward_with_z'):
-            z_prev = self._current_z
-            logits, value, z_new = self.policy.forward_with_z(x, z_prev=z_prev)
-            self._current_z = z_new  # Store for next timestep
+            if self._use_recurrent_z:
+                # True recurrent mode: carry z across timesteps in the same round
+                z_prev = self._current_z
+                logits, value, z_new = self.policy.forward_with_z(x, z_prev=z_prev)
+                self._current_z = z_new  # Store for next timestep
+                self._last_z_prev = None if z_prev is None else z_prev.detach().cpu()
+            else:
+                # Non-recurrent mode: ALWAYS start from zero (z_prev=None) every step
+                self._current_z = None
+                logits, value, _ = self.policy.forward_with_z(x, z_prev=None)
+                self._last_z_prev = None
         else:
             logits, value = self.policy(x)
+            self._last_z_prev = None
         
-        # No action masking - let PPO decide freely
-        # Invalid actions will be handled by the game engine (INVALID_ACTION event)
+        # Mask unsafe actions (tiles about to explode)
+        logits = _mask_unsafe_logits(logits)
         cat = torch.distributions.Categorical(logits=logits)
 
         if self.train:

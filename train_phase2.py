@@ -252,7 +252,17 @@ def train_policy_with_planning(
         print(f"Visited states buffer size: {len(visited_states)}")
     
     # Create policy model from config
-    model = create_model_from_config(config, device=device)
+    # strict_yaml=True: YAML 설정을 엄격하게 따르고, 기본값을 사용하지 않음
+    model = create_model_from_config(config, device=device, strict_yaml=True)
+    
+    # Check model type to determine if DeepSupervision is used
+    from agent_code.ppo_agent.models.vit_trm import PolicyValueViT_TRM_Hybrid
+    from agent_code.ppo_agent.models.vit import PolicyValueViT
+    from agent_code.ppo_agent.models.efficient_gtrxl import PolicyValueEfficientGTrXL
+    is_vit_only = isinstance(model, PolicyValueViT)
+    is_efficient_gtrxl = isinstance(model, PolicyValueEfficientGTrXL)
+    is_hybrid = isinstance(model, PolicyValueViT_TRM_Hybrid)
+    use_deepsup = not (is_vit_only or is_efficient_gtrxl)  # Only TRM models use DeepSupervision
     
     optimizer = create_policy_optimizer(model, lr=lr)
     
@@ -278,10 +288,14 @@ def train_policy_with_planning(
     num_batches_per_epoch = max(1, num_real_samples // batch_size)
     
     print(f"Training configuration:")
+    print(f"  - Model type: {model.__class__.__name__}")
     print(f"  - Total real samples: {num_real_samples}")
     print(f"  - Batch size: {batch_size}")
     print(f"  - Batches per epoch: {num_batches_per_epoch}")
-    print(f"  - DeepSupervision steps (n_sup): {n_sup}")
+    if use_deepsup:
+        print(f"  - DeepSupervision steps (n_sup): {n_sup} (TRM 모델용)")
+    else:
+        print(f"  - DeepSupervision: 사용 안 함 (표준 지도학습, n_sup 파라미터 무시)")
     print(f"  - Strategy: {strategy}")
     
     for epoch in range(num_epochs):
