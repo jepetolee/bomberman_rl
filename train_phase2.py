@@ -273,8 +273,8 @@ def train_policy_with_planning(
         # Generate simulated experiences via planning (if enabled)
         simulated_experiences = []
         if planner is not None and n_planning_steps > 0:
-            print(f"\nEpoch {epoch+1}/{num_epochs}: Generating {n_planning_steps} simulated experiences...")
-            simulated_experiences = planner.plan(n_planning_steps=n_planning_steps)
+            print(f"\nEpoch {epoch+1}/{num_epochs}: Generating {n_planning_steps} simulated experiences... (bonus kappa={planning_bonus_kappa})")
+            simulated_experiences = planner.plan(n_planning_steps=n_planning_steps, kappa=planning_bonus_kappa)
             print(f"  Generated {len(simulated_experiences)} simulated experiences")
         
         if len(simulated_experiences) > 0:
@@ -384,6 +384,8 @@ def main():
     parser.add_argument('--lr', type=float, default=None, help='Learning rate (overrides config)')
     parser.add_argument('--train-value', action='store_true', default=None, help='Train value network with rewards (overrides config)')
     parser.add_argument('--wins-only', action='store_true', help='Use only winning episodes (sum rewards > 0)')
+    parser.add_argument('--planning-bonus-kappa', type=float, default=0.1,
+                        help='Dyna-Q+ bonus kappa for simulated experiences (bonus = kappa/tau)')
     
     args = parser.parse_args()
     
@@ -416,6 +418,7 @@ def main():
     # Planning config
     planning_cfg = phase2_cfg.get('planning', {})
     n_planning_steps = args.planning_steps or planning_cfg.get('n_planning_steps', 100)
+    planning_bonus_kappa = args.planning_bonus_kappa
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")

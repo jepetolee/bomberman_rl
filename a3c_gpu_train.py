@@ -775,41 +775,41 @@ def run_adaptive_training(config: Dict):
         torch.cuda.set_device(device)
     
     if rank == 0:
-        print("="*70)
-        print("A3C GPU: Weight Averaging (Federated Learning Style)")
-        print("="*70)
-        print()
-        print(f"Device: {device}")
-        if device.type == 'cuda':
-            print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print()
-        
-        print("Architecture:")
-        print("  ┌─────────────────────────────────────────────────────┐")
-        print("  │  Each Worker: Independent Local Model              │")
-        print("  │  - Collects experiences                            │")
-        print("  │  - Updates locally via PPO                         │")
-        print("  │  - Sends weights periodically                      │")
-        print("  │                                                     │")
-        print("  │  Main Process: Weight Averaging                    │")
-        print("  │  - Collects weights from all workers              │")
-        print("  │  - Averages weights → Global Model                 │")
-        print("  │  - Distributes to workers                          │")
-        print("  └─────────────────────────────────────────────────────┘")
-        print()
-        
-        print("Curriculum Stages (advance when Team A win rate exceeds threshold):")
-        for i, (name, opponents, threshold) in enumerate(CURRICULUM_STAGES):
-            print(f"  {i+1}. {name}: Team A vs {opponents} → {threshold:.0%}")
-        print(f"  5. {SELF_PLAY_STAGE}")
-        print()
-        
-        print(f"Configuration:")
+    print("="*70)
+    print("A3C GPU: Weight Averaging (Federated Learning Style)")
+    print("="*70)
+    print()
+    print(f"Device: {device}")
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print()
+    
+    print("Architecture:")
+    print("  ┌─────────────────────────────────────────────────────┐")
+    print("  │  Each Worker: Independent Local Model              │")
+    print("  │  - Collects experiences                            │")
+    print("  │  - Updates locally via PPO                         │")
+    print("  │  - Sends weights periodically                      │")
+    print("  │                                                     │")
+    print("  │  Main Process: Weight Averaging                    │")
+    print("  │  - Collects weights from all workers              │")
+    print("  │  - Averages weights → Global Model                 │")
+    print("  │  - Distributes to workers                          │")
+    print("  └─────────────────────────────────────────────────────┘")
+    print()
+    
+    print("Curriculum Stages (advance when Team A win rate exceeds threshold):")
+    for i, (name, opponents, threshold) in enumerate(CURRICULUM_STAGES):
+        print(f"  {i+1}. {name}: Team A vs {opponents} → {threshold:.0%}")
+    print(f"  5. {SELF_PLAY_STAGE}")
+    print()
+    
+    print(f"Configuration:")
         print(f"  Workers: {config['num_workers']} (world_size={world_size})")
-        print(f"  Max Rounds: {config['total_rounds']}")
-        print(f"  Sync Interval: {config['sync_interval']} batches")
-        print(f"  Eval Window: {config['eval_window']} rounds")
-        print()
+    print(f"  Max Rounds: {config['total_rounds']}")
+    print(f"  Sync Interval: {config['sync_interval']} batches")
+    print(f"  Eval Window: {config['eval_window']} rounds")
+    print()
     
     # Create directories - ensure absolute path
     config['results_dir'] = os.path.abspath(config['results_dir'])
@@ -820,11 +820,11 @@ def run_adaptive_training(config: Dict):
     
     # Create global model
     if rank == 0:
-        print("Creating global model...")
+    print("Creating global model...")
     global_model = create_model(config['model_path'], device)
     if rank == 0:
-        print(f"  Parameters: {sum(p.numel() for p in global_model.parameters()):,}")
-        print()
+    print(f"  Parameters: {sum(p.numel() for p in global_model.parameters()):,}")
+    print()
     
     # Trackers
     curriculum = AdaptiveCurriculum(eval_window=config['eval_window'])
@@ -843,7 +843,7 @@ def run_adaptive_training(config: Dict):
     # Start workers
     workers = []
     if rank == 0:
-        print(f"Starting {config['num_workers']} workers...")
+    print(f"Starting {config['num_workers']} workers...")
     
     start_time = time.time()
     
@@ -919,17 +919,17 @@ def run_adaptive_training(config: Dict):
                     collected_weights[msg['worker_id']] = msg['weights']
                 except queue.Empty:
                     break
-
+            
             # Keep collected weights across loops so we can reach the threshold
             if collected_weights:
                 pending_weights.update(collected_weights)
             
             # Average weights if we have enough workers' updates
             if 0 < len(pending_weights) < min_workers_for_sync:
-                if not hasattr(run_adaptive_training, '_last_weight_log') or \
-                   time.time() - getattr(run_adaptive_training, '_last_weight_log', 0) > 30:
+                    if not hasattr(run_adaptive_training, '_last_weight_log') or \
+                       time.time() - getattr(run_adaptive_training, '_last_weight_log', 0) > 30:
                     print(f"[Weight Queue] {len(pending_weights)}/{min_workers_for_sync} workers (waiting for more...)")
-                    setattr(run_adaptive_training, '_last_weight_log', time.time())
+                        setattr(run_adaptive_training, '_last_weight_log', time.time())
             
             if len(pending_weights) >= min_workers_for_sync:
                 sync_count += 1
@@ -957,7 +957,7 @@ def run_adaptive_training(config: Dict):
                     torch.save(global_model.state_dict(), config['model_path'])
                     print(f"[Sync {sync_count}] ★ Averaged {len(weight_list)}/{config['num_workers']} workers "
                           f"+ {global_weight_ratio:.0%} global model (dist world_size={world_size})")
-                    print(f"    Global model updated and saved!")
+                print(f"    Global model updated and saved!")
                 
                 # Clear collected weights after processing
                 pending_weights.clear()
@@ -1089,9 +1089,9 @@ def run_adaptive_training(config: Dict):
     }
     
     if rank == 0:
-        results_file = os.path.join(config['results_dir'], 'training_results.json')
-        with open(results_file, 'w') as f:
-            json.dump(results, f, indent=2)
+    results_file = os.path.join(config['results_dir'], 'training_results.json')
+    with open(results_file, 'w') as f:
+        json.dump(results, f, indent=2)
     
     return results
 

@@ -218,6 +218,10 @@ def setup_training(self):
             SHARED.planning_min_buffer = int(os.environ.get("BOMBER_PLANNING_MIN_BUFFER", "200"))
         except Exception:
             SHARED.planning_min_buffer = 200
+        try:
+            SHARED.planning_bonus_kappa = float(os.environ.get("BOMBER_PLANNING_BONUS_KAPPA", "0.1"))
+        except Exception:
+            SHARED.planning_bonus_kappa = 0.1
 
         SHARED.env_model = None
         SHARED.env_optimizer = None
@@ -521,7 +525,7 @@ def _run_planning_updates(logger=None):
 
         # Sample a start state from visited buffer
         try:
-            start_state, _ = SHARED.visited_states.sample_state()
+            start_state, state_hash = SHARED.visited_states.sample_state()
         except Exception:
             return
 
@@ -555,17 +559,27 @@ def _run_planning_updates(logger=None):
 
                 # World model step (Env model uses ViT only, no TRM)
                 next_state_pred, reward_pred = env_model(state, action)
+                # Dyna-Q+ style bonus: kappa / tau for (state, action)
+                try:
+                    bonus = SHARED.visited_states.get_bonus(state_hash, int(action.item()), getattr(SHARED, "planning_bonus_kappa", 0.1))
+                except Exception:
+                    bonus = 0.0
+                reward_with_bonus = torch.clamp(reward_pred + bonus, -200.0, 200.0)
 
             # Store transition (detach world model outputs)
             sim_states.append(state.squeeze(0).detach().cpu())
             sim_actions.append(int(action.item()))
             sim_logps.append(float(logp.item()))
             sim_values.append(float(value.squeeze(0).item()))
-            sim_rewards.append(float(reward_pred.squeeze(0).item()))
+            sim_rewards.append(float(reward_with_bonus.squeeze(0).item()))
             sim_dones.append(False)
 
             # Advance
             state = next_state_pred.detach()
+            try:
+                state_hash = SHARED.visited_states._hash_state(state.squeeze(0).cpu())
+            except Exception:
+                pass
 
         # Mark terminal at end of simulated rollout
         sim_dones[-1] = True

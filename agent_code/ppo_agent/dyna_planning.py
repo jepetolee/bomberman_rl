@@ -14,6 +14,8 @@ class VisitedStatesBuffer:
         self.states = []  # List of state tensors
         self.state_actions = defaultdict(list)  # state_hash -> list of actions taken
         self.state_indices = {}  # state_hash -> index in self.states
+        self.last_seen = {}  # (state_hash, action) -> timestep last seen
+        self.timestep = 0    # counts real experiences added via add()
         
     def _hash_state(self, state: torch.Tensor) -> str:
         """Create a hash for state (used as key)"""
@@ -46,6 +48,10 @@ class VisitedStatesBuffer:
         idx = self.state_indices[state_hash]
         if action not in self.state_actions[state_hash]:
             self.state_actions[state_hash].append(action)
+        
+        # Track last seen timestep for Dyna-Q+ style bonus
+        self.last_seen[(state_hash, action)] = self.timestep
+        self.timestep += 1
     
     def sample_state(self) -> Tuple[torch.Tensor, str]:
         """
@@ -68,6 +74,21 @@ class VisitedStatesBuffer:
         if state_hash not in self.state_actions or len(self.state_actions[state_hash]) == 0:
             raise ValueError(f"No actions recorded for state hash {state_hash}")
         return random.choice(self.state_actions[state_hash])
+    
+    def get_bonus(self, state_hash: str, action: int, kappa: float) -> float:
+        """
+        Dyna-Q+ style exploration bonus: bonus = kappa / tau, where tau is
+        steps since (state, action) was last seen. If never seen, use current
+        timestep as tau to encourage trying it.
+        """
+        if kappa <= 0:
+            return 0.0
+        last = self.last_seen.get((state_hash, action), -1)
+        if last < 0:
+            tau = max(1, self.timestep)
+        else:
+            tau = max(1, self.timestep - last)
+        return kappa / float(tau)
     
     def __len__(self):
         return len(self.states)
@@ -92,6 +113,7 @@ class DynaPlanner:
         self,
         n_planning_steps: int = 100,
         batch_size: int = 32,
+        kappa: float = 0.1,
     ) -> List[Tuple[torch.Tensor, int, float, torch.Tensor]]:
         """
         Generate simulated experiences through planning
@@ -112,6 +134,7 @@ class DynaPlanner:
             batch_steps = min(batch_size, n_planning_steps - step)
             batch_states = []
             batch_actions = []
+            batch_hashes = []
             
             # Sample states and actions
             for _ in range(batch_steps):
@@ -120,6 +143,7 @@ class DynaPlanner:
                     action = self.visited_states.sample_action_for_state(state_hash)
                     batch_states.append(state)
                     batch_actions.append(action)
+                    batch_hashes.append(state_hash)
                 except (ValueError, KeyError):
                     # Skip if no valid state/action
                     continue
@@ -143,17 +167,19 @@ class DynaPlanner:
                         # Skip this batch if Inf detected
                         continue
                     
-                    # Clamp predictions to reasonable ranges
-                    next_state_pred = torch.clamp(next_state_pred, 0.0, 1.0)  # States should be in [0,1]
-                    reward_pred = torch.clamp(reward_pred, -100.0, 100.0)  # Reasonable reward range
-                    
                     # Add to simulated experiences
                     for i in range(len(batch_states)):
+                        base_reward = float(reward_pred[i].item())
+                        bonus = self.visited_states.get_bonus(batch_hashes[i], batch_actions[i], kappa)
+                        reward_with_bonus = base_reward + bonus
+                        # Clamp predictions to reasonable ranges
+                        next_state_clamped = torch.clamp(next_state_pred[i], 0.0, 1.0)
+                        reward_clamped = float(torch.clamp(torch.tensor(reward_with_bonus), -200.0, 200.0).item())
                         simulated_experiences.append((
                             batch_states[i].cpu(),  # Original state
                             batch_actions[i],       # Action
-                            float(reward_pred[i].item()),  # Predicted reward
-                            next_state_pred[i].cpu(),  # Predicted next state
+                            reward_clamped,         # Reward with Dyna-Q+ bonus
+                            next_state_clamped.cpu(),  # Predicted next state
                         ))
                 except Exception as e:
                     # Skip this batch if prediction fails

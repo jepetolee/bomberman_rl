@@ -53,7 +53,7 @@ class _Shared:
         try:
             self.eps_start = float(os.environ.get("PPO_EPS_START", "0.7"))
         except Exception:
-            self.eps_start = 0.7
+            self.eps_start = 0.4
         try:
             self.eps_end = float(os.environ.get("PPO_EPS_END", "0.2"))  # Keep some teacher guidance
         except Exception:
@@ -469,7 +469,17 @@ def act(self, game_state: dict) -> str:
         cat = torch.distributions.Categorical(logits=logits)
 
         if self.train:
-            action_idx = int(cat.sample().item())
+            # Epsilon-greedy on top of stochastic policy to push more exploration
+            eps = SHARED.current_epsilon()
+            if random.random() < eps:
+                # Uniform over valid actions (logit not -inf)
+                valid_idxs = [i for i, v in enumerate(logits.squeeze(0)) if v > -1e8]
+                if valid_idxs:
+                    action_idx = int(random.choice(valid_idxs))
+                else:
+                    action_idx = int(cat.sample().item())
+            else:
+                action_idx = int(cat.sample().item())
         else:
             action_idx = int(torch.argmax(logits, dim=-1).item())
 
