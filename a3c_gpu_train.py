@@ -223,9 +223,14 @@ def create_model(model_path: str, device: torch.device):
     # Fallback to env-var ViT-only model if YAML (pyyaml) isn't available.
     model = None
     try:
-        from config.load_config import load_config, create_model_from_config  # type: ignore
+        from config.load_config import load_config, create_model_from_config, apply_config_to_env  # type: ignore
         cfg_path = os.environ.get("BOMBER_CONFIG_PATH", "config/trm_config.yaml")
         cfg = load_config(cfg_path)
+        # Export env_vars from YAML so teacher/epsilon settings can be driven there
+        try:
+            apply_config_to_env(cfg)
+        except Exception:
+            pass
         # strict_yaml=True: YAML 설정을 엄격하게 따르고, 기본값을 사용하지 않음
         model = create_model_from_config(cfg, device=device, strict_yaml=True)
         try:
@@ -264,19 +269,16 @@ def create_model(model_path: str, device: torch.device):
         try:
             state_dict = torch.load(model_path, map_location='cpu', weights_only=True)
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=True)
+            if missing_keys or unexpected_keys:
+                print(f"[WARNING] Checkpoint ignored due to mismatch. Missing={len(missing_keys)}, Unexpected={len(unexpected_keys)}")
+                # Keep the freshly built YAML model; do not retry loading
+            else:
+                try:
+                    print(f"[Model] Loaded checkpoint '{model_path}' as {model.__class__.__name__}")
+                except Exception:
+                    pass
         except Exception as e:
-            print(f"[WARNING] Failed to load checkpoint strictly: {e}. Starting from scratch.")
-            missing_keys, unexpected_keys = ["load_failed"], []
-
-        # If any mismatch, ignore checkpoint to avoid wrong architecture loading
-        if missing_keys or unexpected_keys:
-            print(f"[WARNING] Checkpoint ignored due to mismatch. Missing={len(missing_keys)}, Unexpected={len(unexpected_keys)}")
-            model = create_model_from_config(cfg, device=device, strict_yaml=True)
-        else:
-            try:
-                print(f"[Model] Loaded checkpoint '{model_path}' as {model.__class__.__name__}")
-            except Exception:
-                pass
+            print(f"[WARNING] Failed to load checkpoint strictly: {e}. Using YAML model without checkpoint.")
 
     model = model.to(device)
     return model

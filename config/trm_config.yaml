@@ -193,8 +193,14 @@ paths:
 # These settings will be exported as environment variables for scripts
 env_vars:
   # Model type
-  BOMBER_USE_TRM: "1"
-  BOMBER_TRM_RECURRENT: "1"
+  BOMBER_USE_TRM: "0"
+  BOMBER_TRM_RECURRENT: "0"
+  # Teacher / exploration settings
+  PPO_TEACHER_MODULE: "agent_code.rule_based_agent.callbacks"
+  PPO_FORCE_TEACHER_ROUNDS: "500"
+  PPO_EPS_START: "0.05"
+  PPO_EPS_END: "0.001"
+  PPO_EPS_DECAY_ROUNDS: "5000"
   
   # Model dimensions
   BOMBER_VIT_DIM: "256"
