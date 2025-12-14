@@ -300,10 +300,17 @@ def dist_allreduce_model(model: nn.Module):
         return
     for p in model.parameters():
         dist.all_reduce(p.data, op=dist.ReduceOp.SUM)
-        p.data /= world_size
+        # Only divide if floating/complex; ints keep rank0 value
+        if p.data.dtype.is_floating_point or p.data.is_complex():
+            p.data /= world_size
+        else:
+            dist.broadcast(p.data, src=0)
     for b in model.buffers():
         dist.all_reduce(b.data, op=dist.ReduceOp.SUM)
-        b.data /= world_size
+        if b.data.dtype.is_floating_point or b.data.is_complex():
+            b.data /= world_size
+        else:
+            dist.broadcast(b.data, src=0)
 
 
 def average_model_weights(weight_dicts: List[Dict], global_weights: Optional[Dict] = None, 
